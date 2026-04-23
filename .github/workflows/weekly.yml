@@ -1,0 +1,49 @@
+name: Weekly fetch
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"  # 每週一 00:00 UTC = 08:00 台北
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "抓取天數（預設 7）"
+        default: "7"
+      detail:
+        description: "是否抓 tender detail（true/false）"
+        default: "true"
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Fetch bids
+        run: |
+          DAYS="${{ github.event.inputs.days || '7' }}"
+          DETAIL="${{ github.event.inputs.detail || 'true' }}"
+          if [ "$DETAIL" = "false" ]; then
+            python scripts/fetch_bids.py --days "$DAYS" --no-detail --out data/weekly.csv
+          else
+            python scripts/fetch_bids.py --days "$DAYS" --out data/weekly.csv
+          fi
+
+      - name: Merge to master
+        run: python scripts/merge.py --weekly data/weekly.csv --master data/bids.csv
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/bids.csv
+          git diff --cached --quiet || git commit -m "data: weekly update $(date -u +%Y-%m-%d)"
+          git push

@@ -97,6 +97,12 @@ def load():
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df["month"] = df["date"].dt.to_period("M").astype(str)
     df["unit_type"] = df["unit_name"].apply(classify_unit)
+    # g0v 搬遷後舊 URL 失效 → 改用 Google 搜 job_number + 標題
+    from urllib.parse import quote_plus
+    df["url"] = df.apply(
+        lambda r: f"https://www.google.com/search?q={quote_plus(str(r['job_number']) + ' ' + str(r['title']))}",
+        axis=1,
+    )
     # 過濾：有 category 的必須符合 IT 白名單；category 空的保留（多半是非決標/無詳情）
     mask = df["category"].fillna("").apply(lambda c: (c == "") or bool(IT_CATEGORY_RE.match(c)))
     df = df[mask].reset_index(drop=True)
@@ -465,6 +471,10 @@ with tab4:
 with tab5:
     st.subheader("🎯 機會雷達（O+R 可投的標案）")
     st.caption("鎖定強項關鍵字 + Watch List 機關，區分「招標中可投」與「已被誰拿走」")
+
+    with st.expander("📋 Watch List 鎖定機關（點開看）", expanded=False):
+        st.write("、".join(WATCH_UNITS))
+        st.caption("在 app.py 修改 WATCH_UNITS 變數可調整")
 
     col1, col2, col3 = st.columns(3)
     picked_strengths = col1.multiselect("強項關鍵字", list(STRENGTH_KEYWORDS.keys()),

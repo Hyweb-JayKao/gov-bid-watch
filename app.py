@@ -9,6 +9,9 @@ st.set_page_config(page_title="政府標案觀測", layout="wide")
 
 DATA_PATH = "data/bids.csv"
 
+# IT 白名單（符合才算軟體開發類；category 為空的列不過濾，靠 title 已篩過）
+IT_CATEGORY_RE = re.compile(r"^(勞務類(84\d|75)|財物類(452|47))")
+
 # 需求主題關鍵字（用於分析機關/廠商的需求類型）
 DEMAND_THEMES = {
     "系統建置": ["系統建置", "建置案", "開發案", "新建", "導入"],
@@ -75,6 +78,9 @@ def load():
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df["month"] = df["date"].dt.to_period("M").astype(str)
     df["unit_type"] = df["unit_name"].apply(classify_unit)
+    # 過濾：有 category 的必須符合 IT 白名單；category 空的保留（多半是非決標/無詳情）
+    mask = df["category"].fillna("").apply(lambda c: (c == "") or bool(IT_CATEGORY_RE.match(c)))
+    df = df[mask].reset_index(drop=True)
     return df
 
 

@@ -12,6 +12,25 @@ DATA_PATH = "data/bids.csv"
 # IT 白名單（符合才算軟體開發類；category 為空的列不過濾，靠 title 已篩過）
 IT_CATEGORY_RE = re.compile(r"^(勞務類(84\d|75)|財物類(452|47))")
 
+# 攻略 Watch List（鎖定機關）
+WATCH_UNITS = [
+    "衛生福利部", "食品藥物管理署", "疾病管制署",
+    "考試院", "考選部",
+    "國立臺灣師範大學", "國立臺灣大學", "國立政治大學",
+    "中央警察大學", "法務部調查局", "法務部",
+    "衛生福利部嘉南療養院",
+]
+
+# O + R 強項關鍵字（機會 match）
+STRENGTH_KEYWORDS = {
+    "圖書館/閱讀": ["圖書館", "圖書", "借閱", "館藏", "閱讀"],
+    "政府 App": ["App", "APP", "應用程式", "行動"],
+    "開放資料": ["開放資料", "Open Data", "資料集", "資料開放", "資料平台", "資料平臺"],
+    "AI/LLM": ["AI", "人工智慧", "機器學習", "LLM", "TAIDE", "語料", "生成式", "OCR", "NLP"],
+    "無障礙": ["無障礙", "WCAG"],
+    "網站/入口": ["網站", "入口網", "官網"],
+}
+
 # 需求主題關鍵字（用於分析機關/廠商的需求類型）
 DEMAND_THEMES = {
     "系統建置": ["系統建置", "建置案", "開發案", "新建", "導入"],
@@ -100,7 +119,7 @@ st.caption(
     f"共 {len(df):,} 筆 · 跨度 {date_span_days} 天"
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["市場", "趨勢", "競爭", "機關", "清單"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "清單"])
 
 # ---------- 市場 ----------
 with tab1:
@@ -442,8 +461,73 @@ with tab4:
     ).sort_values("案件數", ascending=False).head(50)
     st.dataframe(unit_agg, use_container_width=True)
 
-# ---------- 清單 ----------
+# ---------- 雷達 ----------
 with tab5:
+    st.subheader("🎯 機會雷達（O+R 可投的標案）")
+    st.caption("鎖定強項關鍵字 + Watch List 機關，區分「招標中可投」與「已被誰拿走」")
+
+    col1, col2, col3 = st.columns(3)
+    picked_strengths = col1.multiselect("強項關鍵字", list(STRENGTH_KEYWORDS.keys()),
+                                         default=list(STRENGTH_KEYWORDS.keys()))
+    min_amt_wan = col2.number_input("最小金額（萬）", value=200, step=100)
+    use_watchlist = col3.checkbox("只看 Watch List 機關", value=False)
+
+    # 套用篩選
+    kws = [k for s in picked_strengths for k in STRENGTH_KEYWORDS[s]]
+    radar = df.copy()
+    if kws:
+        radar = radar[radar["title"].fillna("").apply(lambda t: any(k in t for k in kws))]
+    if use_watchlist:
+        radar = radar[radar["unit_name"].fillna("").apply(lambda u: any(w in u for w in WATCH_UNITS))]
+    # 金額門檻：對招標中無金額的用 budget，已決標的用 award_amount
+    def passes_amount(row):
+        amt = row["award_amount"] if pd.notna(row["award_amount"]) else row["budget"]
+        if pd.isna(amt):
+            return True  # 沒金額資訊的暫時保留（招標中未公告金額）
+        return amt >= min_amt_wan * 10000
+    radar = radar[radar.apply(passes_amount, axis=1)]
+
+    # 分「招標中」與「已決標」
+    in_tender = radar[radar["type"].str.contains("公開招標|限制性招標|公開取得", na=False)]
+    awarded = radar[radar["type"] == "決標公告"]
+
+    st.markdown(f"### 🟢 招標中可投（{len(in_tender)} 件）")
+    if len(in_tender):
+        view1 = in_tender.sort_values("budget", ascending=False)
+        st.dataframe(
+            view1[["date", "unit_name", "unit_type", "title", "budget", "type", "url"]],
+            use_container_width=True,
+            column_config={"url": st.column_config.LinkColumn("連結"), "budget": "預算"},
+        )
+    else:
+        st.info("目前無符合條件的招標中案件")
+
+    st.markdown(f"### 🔴 已被拿走（{len(awarded)} 件，學對手）")
+    if len(awarded):
+        view2 = awarded.copy()
+        view2["凌網?"] = view2["companies"].fillna("").apply(lambda s: any(k in s for k in OWN_COMPANIES))
+        view2 = view2.sort_values("award_amount", ascending=False)
+        st.dataframe(
+            view2[["date", "unit_name", "title", "award_amount", "companies", "凌網?", "url"]],
+            use_container_width=True,
+            column_config={"url": st.column_config.LinkColumn("連結"), "award_amount": "決標金額"},
+        )
+
+        st.divider()
+        st.markdown("**搶走這塊餅的 Top 10 廠商**")
+        exp = awarded.dropna(subset=["companies"]).copy()
+        exp["company"] = exp["companies"].str.split("|")
+        exp = exp.explode("company")
+        exp["company"] = exp["company"].str.strip()
+        rival = exp.groupby("company").agg(
+            次數=("job_number", "count"),
+            總金額=("award_amount", "sum"),
+        ).sort_values("次數", ascending=False).head(10)
+        rival["自家"] = rival.index.to_series().apply(lambda c: any(k in c for k in OWN_COMPANIES))
+        st.dataframe(rival, use_container_width=True)
+
+# ---------- 清單 ----------
+with tab6:
     col1, col2, col3 = st.columns(3)
     types = col1.multiselect("類型", df["type"].dropna().unique())
     kw = col2.text_input("標題關鍵字")

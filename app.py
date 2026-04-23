@@ -125,7 +125,7 @@ st.caption(
     f"共 {len(df):,} 筆 · 跨度 {date_span_days} 天"
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "清單"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "清單"])
 
 # ---------- 市場 ----------
 with tab1:
@@ -407,29 +407,42 @@ with tab4:
 
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown("**Top 5 承接廠商**")
-            aw_c = sub_award[sub_award["companies"].notna()].copy()
-            if len(aw_c):
-                aw_c["company"] = aw_c["companies"].str.split("|")
-                exp = aw_c.explode("company")
-                exp["company"] = exp["company"].str.strip()
-                top_vendors = exp.groupby("company").agg(
-                    案數=("job_number", "count"),
-                    金額=("award_amount", "sum"),
-                ).sort_values("案數", ascending=False).head(5)
-                top_vendors["金額"] = (top_vendors["金額"] / 1e4).round(0).astype(int).astype(str) + " 萬"
-                st.dataframe(top_vendors, use_container_width=True)
-            else:
-                st.caption("尚無決標廠商資料")
-        with col2:
             st.markdown("**案件類型分布**")
             type_dist = sub.groupby("type").size().sort_values(ascending=False)
             st.dataframe(type_dist.rename("案數"), use_container_width=True)
+        with col2:
+            if "category" in sub.columns and sub["category"].notna().any():
+                st.markdown("**Top 5 標的分類**")
+                cat_dist = sub["category"].value_counts().head(5)
+                st.dataframe(cat_dist.rename("案數"), use_container_width=True)
 
-        if "category" in sub.columns and sub["category"].notna().any():
-            st.markdown("**Top 5 標的分類**")
-            cat_dist = sub["category"].value_counts().head(5)
-            st.dataframe(cat_dist.rename("案數"), use_container_width=True)
+        st.markdown("**服務此機關的所有廠商**（含擅長領域）")
+        aw_c = sub_award[sub_award["companies"].notna()].copy()
+        if len(aw_c):
+            aw_c["company"] = aw_c["companies"].str.split("|")
+            exp = aw_c.explode("company")
+            exp["company"] = exp["company"].str.strip()
+            agg_v = exp.groupby("company").agg(
+                案數=("job_number", "count"),
+                金額=("award_amount", "sum"),
+            ).sort_values("案數", ascending=False)
+            agg_v["金額（萬）"] = (agg_v["金額"] / 1e4).round(0).astype(int)
+            # 算各廠商在「整體資料」裡的擅長領域（依 demand theme 命中）
+            all_aw = df[df["type"].str.contains("決標", na=False) & df["companies"].notna()].copy()
+            all_aw["company"] = all_aw["companies"].str.split("|")
+            all_exp = all_aw.explode("company")
+            all_exp["company"] = all_exp["company"].str.strip()
+            vendor_themes = {}
+            for v in agg_v.index:
+                v_titles = all_exp.loc[all_exp["company"] == v, "title"].dropna().tolist()
+                themes = count_themes(v_titles)
+                top_t = sorted(themes.items(), key=lambda x: -x[1])[:3]
+                vendor_themes[v] = ", ".join(f"{t}({n})" for t, n in top_t) if top_t else "—"
+            agg_v["擅長領域 Top 3"] = agg_v.index.to_series().map(vendor_themes)
+            agg_v["自家"] = agg_v.index.to_series().apply(is_own)
+            st.dataframe(agg_v[["案數", "金額（萬）", "擅長領域 Top 3", "自家"]], use_container_width=True)
+        else:
+            st.caption("尚無決標廠商資料")
 
         st.markdown("**需求主題分布**（依標題關鍵字命中）")
         themes = count_themes(sub["title"].dropna().tolist())
@@ -536,8 +549,62 @@ with tab5:
         rival["自家"] = rival.index.to_series().apply(lambda c: any(k in c for k in OWN_COMPANIES))
         st.dataframe(rival, use_container_width=True)
 
-# ---------- 清單 ----------
+# ---------- 對手查詢 ----------
 with tab6:
+    st.subheader("🔎 對手查詢（業務用）")
+    st.caption("評估案子時用：輸入標題關鍵字 或 機關名稱，查誰做過類似 / 服務過這個機關")
+
+    col1, col2 = st.columns(2)
+    title_kw = col1.text_input("標題關鍵字（多個空白分隔，AND）", placeholder="例：AI 衛生")
+    all_units = sorted(df["unit_name"].dropna().unique().tolist())
+    picked_units = col2.multiselect(
+        "機關（可多選，輸入文字即模糊搜尋）",
+        all_units,
+        placeholder=f"資料庫共 {len(all_units)} 個機關，輸入關鍵字搜尋",
+    )
+
+    if title_kw or picked_units:
+        matched = df.copy()
+        if title_kw:
+            for t in title_kw.strip().split():
+                matched = matched[matched["title"].fillna("").str.contains(t, case=False, na=False)]
+        if picked_units:
+            matched = matched[matched["unit_name"].isin(picked_units)]
+        st.caption(f"命中 {len(matched):,} 筆")
+
+        if len(matched):
+            # 命中機關
+            unit_hits = matched["unit_name"].value_counts()
+            st.markdown(f"**命中機關**（{unit_hits.shape[0]} 個）")
+            st.dataframe(unit_hits.rename("案數").head(30), use_container_width=True)
+
+            # 競爭廠商（只有決標類有 company）
+            vend = matched[matched["companies"].notna()].copy()
+            if len(vend):
+                vend["company"] = vend["companies"].str.split("|")
+                v_exp = vend.explode("company")
+                v_exp["company"] = v_exp["company"].str.strip()
+                rival_agg = v_exp.groupby("company").agg(
+                    次數=("job_number", "count"),
+                    總金額=("award_amount", "sum"),
+                ).sort_values("次數", ascending=False)
+                rival_agg["金額（萬）"] = (rival_agg["總金額"].fillna(0) / 1e4).round(0).astype(int)
+                rival_agg["自家"] = rival_agg.index.to_series().apply(is_own)
+                st.markdown(f"**競爭廠商**（{len(rival_agg)} 家）")
+                st.dataframe(rival_agg[["次數", "金額（萬）", "自家"]], use_container_width=True)
+
+            st.markdown("**相關案件**")
+            cols_show = ["date", "unit_name", "type", "title", "budget", "award_amount", "companies", "url"]
+            st.dataframe(
+                matched[cols_show].sort_values("award_amount", ascending=False),
+                use_container_width=True,
+                column_config={"url": st.column_config.LinkColumn("連結")},
+            )
+    else:
+        st.info("輸入標題關鍵字或機關關鍵字後顯示結果")
+
+# ---------- 清單 ----------
+with tab7:
     col1, col2, col3 = st.columns(3)
     types = col1.multiselect("類型", df["type"].dropna().unique())
     kw = col2.text_input("標題關鍵字")

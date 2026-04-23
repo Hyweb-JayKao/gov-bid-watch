@@ -132,6 +132,35 @@ with tab1:
         st.info("尚無金額資料")
 
     st.divider()
+    st.subheader("錢往哪：Top 10 標的分類金額佔比")
+    if len(award) and "category" in award.columns and award["category"].notna().any():
+        cat_amt = award.groupby("category")["award_amount"].sum().sort_values(ascending=False).head(10)
+        cat_df = (cat_amt / 1e8).reset_index()
+        cat_df.columns = ["分類", "金額(億)"]
+        fig = px.bar(cat_df, x="金額(億)", y="分類", orientation="h",
+                     text=cat_df["金額(億)"].round(2))
+        fig.update_yaxes(categoryorder="total ascending")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("尚無分類金額資料（需 v4 detail）")
+
+    st.divider()
+    st.subheader("錢往哪：需求主題金額分布")
+    if len(award):
+        theme_rows = []
+        for theme, kws in DEMAND_THEMES.items():
+            mask = award["title"].fillna("").apply(lambda t: any(k in t for k in kws))
+            amt = award.loc[mask, "award_amount"].sum()
+            cnt = mask.sum()
+            if cnt:
+                theme_rows.append({"主題": theme, "金額(億)": amt / 1e8, "案數": cnt})
+        if theme_rows:
+            theme_df = pd.DataFrame(theme_rows).sort_values("金額(億)", ascending=True)
+            fig = px.bar(theme_df, x="金額(億)", y="主題", orientation="h",
+                         hover_data=["案數"], text=theme_df["金額(億)"].round(2))
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
     st.subheader("YoY（同月對比）")
     if len(award):
         tmp = award.copy()

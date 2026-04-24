@@ -29,3 +29,4 @@ data/tmp_*.csv
 .claude/skills/test-driven-development
 .claude/skills/using-agent-skills
 .claude/commands/
+.claude/settings.local.json

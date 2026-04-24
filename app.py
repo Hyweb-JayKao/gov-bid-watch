@@ -125,7 +125,7 @@ st.caption(
     f"共 {len(df):,} 筆 · 跨度 {date_span_days} 天"
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "清單"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "公司查詢", "清單"])
 
 # ---------- 市場 ----------
 with tab1:
@@ -603,8 +603,73 @@ with tab6:
     else:
         st.info("輸入標題關鍵字或機關關鍵字後顯示結果")
 
-# ---------- 清單 ----------
+# ---------- 公司查詢 ----------
 with tab7:
+    st.subheader("🏢 公司查詢（過去 12 個月得標）")
+    st.caption("投標前快查：輸入公司名（部分即可）→ 該公司在資料集最新日往前 365 天內的所有決標案")
+
+    kw = st.text_input("公司名（部分即可，case-insensitive）", placeholder="例：關貿、凌網、精誠")
+
+    if not kw:
+        st.info("輸入公司名後顯示結果")
+    else:
+        cutoff = df["date"].max() - pd.Timedelta(days=365)
+        base = df[
+            df["type"].str.contains("決標", na=False)
+            & df["award_amount"].notna()
+            & (df["date"] >= cutoff)
+        ].copy()
+        base["company"] = base["companies"].fillna("").str.split("|")
+        exp = base.explode("company")
+        exp["company"] = exp["company"].str.strip()
+        hit = exp[exp["company"].str.contains(kw, case=False, na=False)]
+
+        if len(hit) == 0:
+            st.warning(f"「{kw}」過去 12 個月無得標紀錄（資料窗：{cutoff.strftime('%Y-%m-%d')} ~ {df['date'].max().strftime('%Y-%m-%d')}）")
+        else:
+            hit_cases = hit.drop_duplicates(subset=["job_number", "unit_id", "date"])
+            distinct_companies = sorted(hit["company"].dropna().unique().tolist())
+            if len(distinct_companies) > 1:
+                st.caption(f"⚠️ 命中 {len(distinct_companies)} 家公司：{' ｜ '.join(distinct_companies)}")
+            total_amt = hit_cases["award_amount"].sum()
+            n_cases = len(hit_cases)
+            avg_amt = hit_cases["award_amount"].mean()
+            n_units = hit_cases["unit_name"].nunique()
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("得標案數", f"{n_cases:,}")
+            if total_amt >= 1e8:
+                c2.metric("總得標金額（億）", f"{total_amt / 1e8:.2f}")
+            else:
+                c2.metric("總得標金額（萬）", f"{total_amt / 1e4:,.0f}")
+            c3.metric("平均單案（萬）", f"{avg_amt / 1e4:,.0f}" if pd.notna(avg_amt) else "—")
+            c4.metric("合作機關數", f"{n_units:,}")
+
+            st.markdown("**Top 5 合作機關**")
+            top_units = hit_cases.groupby("unit_name").agg(
+                案數=("job_number", "count"),
+                金額=("award_amount", "sum"),
+            ).sort_values("案數", ascending=False).head(5)
+            top_units["金額（萬）"] = (top_units["金額"].fillna(0) / 1e4).round(0).astype(int)
+            st.dataframe(top_units[["案數", "金額（萬）"]], use_container_width=True)
+
+            st.divider()
+            st.caption(f"明細 {len(hit):,} 筆（含聯合承攬展開） · 資料窗 {cutoff.strftime('%Y-%m-%d')} ~ {df['date'].max().strftime('%Y-%m-%d')}")
+            detail = hit[["date", "unit_name", "title", "award_amount", "budget", "company", "url"]] \
+                .sort_values("date", ascending=False)
+            st.dataframe(
+                detail,
+                use_container_width=True,
+                column_config={
+                    "url": st.column_config.LinkColumn("連結"),
+                    "award_amount": st.column_config.NumberColumn("得標金額", format="%d"),
+                    "budget": st.column_config.NumberColumn("預算", format="%d"),
+                    "date": st.column_config.DateColumn("日期", format="YYYY-MM-DD"),
+                },
+            )
+
+# ---------- 清單 ----------
+with tab8:
     col1, col2, col3 = st.columns(3)
     types = col1.multiselect("類型", df["type"].dropna().unique())
     kw = col2.text_input("標題關鍵字")

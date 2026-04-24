@@ -6,8 +6,8 @@ import pandas as pd
 # IT 白名單（符合才算軟體開發類）
 IT_CATEGORY_RE = re.compile(r"^(勞務類(84\d|75)|財物類(452|47))")
 
-# 凌網系列：任一匹配即標示為自家
-OWN_COMPANIES = ["凌網資訊", "凌網全球", "HYWEB", "網擎"]
+# 凌網科技系列：任一匹配即標示為自家（預設凌網科技；可依實際需求調整）
+OWN_COMPANIES = ["凌網科技", "凌網資訊", "凌網全球", "凌網知識", "HYWEB", "網擎"]
 
 # 攻略 Watch List（鎖定機關）
 WATCH_UNITS = [

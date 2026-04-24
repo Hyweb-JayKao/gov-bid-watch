@@ -30,6 +30,8 @@ def test_classify_unit_nan():
 def test_is_own_positive():
     assert is_own("凌網資訊股份有限公司") is True
     assert is_own("網擎資訊") is True
+    assert is_own("凌網科技股份有限公司") is True
+    assert is_own("凌網知識股份有限公司") is True
 
 
 def test_is_own_negative():

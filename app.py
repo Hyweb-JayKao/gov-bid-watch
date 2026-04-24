@@ -654,8 +654,8 @@ with tab9:
                 案數=("job_number", "count"),
                 總金額=("award_amount", "sum"),
             ).sort_values("總金額", ascending=False)
-            total_amt9 = agg9["總金額"].sum()
-            agg9["市占率(%)"] = (agg9["總金額"] / total_amt9 * 100).round(1) if total_amt9 else 0
+            pool_total = pool["award_amount"].sum()
+            agg9["市占率(%)"] = (agg9["總金額"] / pool_total * 100).round(1) if pool_total else 0
             agg9["金額(萬)"] = (agg9["總金額"] / 1e4).round(0).astype(int)
             agg9["自家"] = agg9.index.to_series().apply(is_own)
             agg9["排名"] = range(1, len(agg9) + 1)
@@ -663,7 +663,7 @@ with tab9:
             c1, c2, c3 = st.columns(3)
             c1.metric("命中案數", f"{len(pool):,}")
             c2.metric("參與廠商數", f"{len(agg9):,}")
-            c3.metric("搜尋結果總金額（億）", f"{total_amt9 / 1e8:.2f}")
+            c3.metric("搜尋結果總金額（億）", f"{pool_total / 1e8:.2f}")
 
             st.divider()
             st.markdown(f"**Top 10（關鍵字：{kw9}｜近 12 個月）**")

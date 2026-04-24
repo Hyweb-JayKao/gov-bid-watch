@@ -3,14 +3,22 @@
 ## 架構
 
 ```
-GitHub Actions (cron 每週一 08:00 台北)
-  → scripts/fetch_bids.py --days 7
-  → scripts/merge.py → data/bids.csv
-  → commit + push
+本機 launchd (每週一 08:00 台北)
+  ~/Library/LaunchAgents/com.jaykao.gov-bid-watch.plist
+  → ~/scripts/gov-bid-watch-weekly.sh
+    → scripts/fetch_bids.py --days 7
+    → scripts/merge.py → data/bids.csv
+    → commit + push
       ↓
 Streamlit Community Cloud (app.py)
   → 讀 data/bids.csv 渲染
 ```
+
+**為什麼用 launchd 不是 GitHub Actions**：
+g0v API (pcc-api.openfun.app) Cloudflare 擋 GitHub Actions IP 段回 403，
+本機跑 OK。Actions workflow 保留手動觸發備用。
+
+**Log 位置**：`~/Library/Logs/gov-bid-watch/run_*.log`（保留最近 10 份）
 
 ## 資料來源
 
@@ -25,13 +33,12 @@ Streamlit Community Cloud (app.py)
 ## 本地開發
 
 ```bash
+# repo 路徑：~/repos/gov-bid-watch
+cd ~/repos/gov-bid-watch
 pip install -r requirements.txt
 
-# 抓過去 30 天（含金額 + 分類，較慢）
+# 抓過去 N 天
 python scripts/fetch_bids.py --days 30 --out data/weekly.csv
-
-# 快速版（不含金額）
-python scripts/fetch_bids.py --days 30 --no-detail --out data/weekly.csv
 
 # 合併到主檔
 python scripts/merge.py --weekly data/weekly.csv
@@ -46,9 +53,12 @@ streamlit run app.py
 2. 連 GitHub → 選本 repo → main 分支 → `app.py`
 3. Deploy，自動給 URL
 
-## 手動觸發 Actions
+## 手動觸發 launchd（即刻跑一次）
 
-Repo → Actions → Weekly fetch → Run workflow，可改 `days` 與 `detail` 參數。
+```bash
+launchctl start com.jaykao.gov-bid-watch
+tail -f ~/Library/Logs/gov-bid-watch/run_*.log
+```
 
 ## TODO
 

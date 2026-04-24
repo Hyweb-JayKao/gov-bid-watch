@@ -1,8 +1,12 @@
-name: Weekly fetch
+name: Weekly fetch (DISABLED — 改由本機 launchd 跑)
+
+# 停用原因: GitHub Actions IP 段被 g0v API (pcc-api.openfun.app) 擋 403
+# 改用本機 launchd: ~/Library/LaunchAgents/com.jaykao.gov-bid-watch.plist
+# 每週一 08:00 本機執行 ~/scripts/gov-bid-watch-weekly.sh
 
 on:
-  schedule:
-    - cron: "0 0 * * 1"  # 每週一 00:00 UTC = 08:00 台北
+  # schedule:
+  #   - cron: "0 0 * * 1"  # 停用：API 擋 GitHub Actions IP
   workflow_dispatch:
     inputs:
       days:

@@ -9,7 +9,8 @@
 | [001](001-pre-bid-intel/) | 投標前對手情報 | 🟢 演進中 | 業務查對手、機關、擅長領域 |
 | [002](002-opportunity-radar/) | 機會雷達（可投標案篩選） | 🟢 已上線 | tab5 雷達 |
 | [003](003-market-watch/) | 市場觀測（大盤趨勢） | 🟢 已上線 | tab1/2/4 市場/趨勢/機關 |
-| [004](004-watch-list/) | Watch List（追蹤關注標案） | 🟢 已上線 | Watch List |
+| [004](004-watch-list/) | Watch List（鎖定關鍵客戶機關） | 🟢 已上線 | WATCH_UNITS + tab5 篩選 |
+| [005](005-free-browse/) | 自由瀏覽 | 🟢 已上線 | tab8 清單 |
 
 ## 目錄結構
 ```

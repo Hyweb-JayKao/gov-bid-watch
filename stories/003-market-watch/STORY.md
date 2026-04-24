@@ -9,10 +9,9 @@
 一眼看出本季市場總量、跟上季比增減、哪類機關下單最多。
 
 ## 涵蓋 features
-- [x] **market-overview**（市場大小）— 已上線，app.py tab1
-- [x] **trend-chart**（趨勢）— 已上線，app.py tab2
-- [x] **agency-distribution**（機關分佈）— 已上線，app.py tab4
-- 📎 三個均未補寫 SPEC，code 為準
+- [x] **market-overview**（市場大小）— tab1，[SPEC](features/market-overview/SPEC.md)
+- [x] **trend-chart**（趨勢）— tab2，[SPEC](features/trend-chart/SPEC.md)
+- [x] **agency-distribution**（機關分佈）— tab4，[SPEC](features/agency-distribution/SPEC.md)
 
 ## 相關 commits
 （早期 commits，見 app.py tab1/2/4 定義）

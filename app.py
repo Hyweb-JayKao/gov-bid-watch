@@ -57,7 +57,7 @@ st.caption(
     f"共 {len(df):,} 筆 · 跨度 {date_span_days} 天"
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "公司查詢", "清單"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "公司查詢", "清單", "同領域"])
 
 # ---------- 市場 ----------
 with tab1:
@@ -629,3 +629,60 @@ with tab8:
         use_container_width=True,
         column_config={"url": st.column_config.LinkColumn("連結")},
     )
+
+# ---------- 同領域對手排名 ----------
+with tab9:
+    st.subheader("同領域對手排名")
+    st.caption("輸入關鍵字（比對 title），看近 12 個月該領域誰是老大、自家排第幾")
+    kw9 = st.text_input("關鍵字", placeholder="例：圖書館、資安、AI、無障礙")
+    if kw9:
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=365)
+        pool = df[
+            df["type"].str.contains("決標", na=False)
+            & df["award_amount"].notna()
+            & df["companies"].notna()
+            & (df["date"] >= cutoff)
+            & df["title"].str.contains(kw9, na=False)
+        ].copy()
+        if len(pool):
+            pool["company"] = pool["companies"].str.split("|")
+            exp9 = pool.explode("company")
+            exp9["company"] = exp9["company"].str.strip()
+            exp9 = exp9[exp9["company"] != ""]
+
+            agg9 = exp9.groupby("company").agg(
+                案數=("job_number", "count"),
+                總金額=("award_amount", "sum"),
+            ).sort_values("總金額", ascending=False)
+            total_amt9 = agg9["總金額"].sum()
+            agg9["市占率(%)"] = (agg9["總金額"] / total_amt9 * 100).round(1) if total_amt9 else 0
+            agg9["金額(萬)"] = (agg9["總金額"] / 1e4).round(0).astype(int)
+            agg9["自家"] = agg9.index.to_series().apply(is_own)
+            agg9["排名"] = range(1, len(agg9) + 1)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("命中案數", f"{len(pool):,}")
+            c2.metric("參與廠商數", f"{len(agg9):,}")
+            c3.metric("搜尋結果總金額（億）", f"{total_amt9 / 1e8:.2f}")
+
+            st.divider()
+            st.markdown(f"**Top 10（關鍵字：{kw9}｜近 12 個月）**")
+            top10 = agg9.head(10).reset_index()[["排名", "company", "案數", "金額(萬)", "市占率(%)", "自家"]]
+            top10 = top10.rename(columns={"company": "廠商"})
+            st.dataframe(top10, use_container_width=True, hide_index=True)
+
+            own9 = agg9[agg9["自家"]]
+            if len(own9):
+                not_in_top = own9[own9["排名"] > 10]
+                if len(not_in_top):
+                    lines = [
+                        f"- **{name}**：第 {int(row['排名'])} 名（案數 {int(row['案數'])}、金額 {int(row['金額(萬)']):,} 萬、市占 {row['市占率(%)']}%）"
+                        for name, row in not_in_top.iterrows()
+                    ]
+                    st.info("**我方排名（未進 Top 10）**\n" + "\n".join(lines))
+                else:
+                    st.success("自家已進 Top 10 ✅")
+            else:
+                st.warning(f"近 12 個月內「{kw9}」領域自家無得標紀錄")
+        else:
+            st.info(f"近 12 個月內無「{kw9}」相關決標案件")

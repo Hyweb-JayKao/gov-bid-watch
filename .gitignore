@@ -5,3 +5,27 @@ __pycache__/
 .DS_Store
 data/*.log
 data/tmp_*.csv
+
+# agent-skills plugin (symlink 到 ~/.agent-skills，只在 Jay 本機用)
+.claude/skills/api-and-interface-design
+.claude/skills/browser-testing-with-devtools
+.claude/skills/ci-cd-and-automation
+.claude/skills/code-review-and-quality
+.claude/skills/code-simplification
+.claude/skills/context-engineering
+.claude/skills/debugging-and-error-recovery
+.claude/skills/deprecation-and-migration
+.claude/skills/documentation-and-adrs
+.claude/skills/frontend-ui-engineering
+.claude/skills/git-workflow-and-versioning
+.claude/skills/idea-refine
+.claude/skills/incremental-implementation
+.claude/skills/performance-optimization
+.claude/skills/planning-and-task-breakdown
+.claude/skills/security-and-hardening
+.claude/skills/shipping-and-launch
+.claude/skills/source-driven-development
+.claude/skills/spec-driven-development
+.claude/skills/test-driven-development
+.claude/skills/using-agent-skills
+.claude/commands/

@@ -1,8 +1,13 @@
 """Streamlit dashboard：政府標案觀測（軟體開發類）。"""
+import json
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import compliance
+import rfi_check
 from helpers import (
     DEMAND_THEMES,
     HIGHLIGHT_COLOR,
@@ -18,6 +23,15 @@ from helpers import (
 st.set_page_config(page_title="政府標案觀測", layout="wide")
 
 DATA_PATH = "data/bids.csv"
+LAW_PATH = "data/law/procurement_act.json"
+
+
+@st.cache_data(ttl=86400)
+def load_law():
+    p = Path(LAW_PATH)
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 @st.cache_data(ttl=3600)
@@ -57,7 +71,9 @@ st.caption(
     f"共 {len(df):,} 筆 · 跨度 {date_span_days} 天"
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "公司查詢", "清單", "同領域"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+    ["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "公司查詢", "清單", "同領域", "法規"]
+)
 
 # ---------- 市場 ----------
 with tab1:
@@ -686,3 +702,165 @@ with tab9:
                 st.warning(f"近 12 個月內「{kw9}」領域自家無得標紀錄")
         else:
             st.info(f"近 12 個月內無「{kw9}」相關決標案件")
+
+# ---------- 法規 ----------
+with tab10:
+    law_tab_articles, law_tab_check, law_tab_rfi = st.tabs(
+        ["條文查詢", "合規查核 (已決標案)", "RFI 文件檢核"]
+    )
+
+with law_tab_articles:
+    st.subheader("政府採購法條文")
+    law = load_law()
+    if not law:
+        st.warning(
+            f"找不到 `{LAW_PATH}`。請執行 `python scripts/fetch_law.py` 產生。"
+        )
+    else:
+        st.caption(
+            f"{law['law_name']}（{law['law_code']}）· "
+            f"修正日期 {law['amended_date']} · 共 {law['article_count']} 條 · "
+            f"[來源]({law['source_url']}) · 抓取時間 {law['fetched_at']}"
+        )
+
+        chapters = []
+        seen = set()
+        for a in law["articles"]:
+            if a["chapter"] and a["chapter"] not in seen:
+                seen.add(a["chapter"])
+                chapters.append(a["chapter"])
+
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            kw = st.text_input("關鍵字（搜全文）", "", key="law_kw")
+        with c2:
+            ch = st.selectbox("章節", ["全部"] + chapters, key="law_chapter")
+        with c3:
+            art_no = st.text_input("條號（精確）", "", key="law_no", placeholder="例：26-2")
+
+        results = law["articles"]
+        if art_no.strip():
+            target = art_no.strip().replace("第", "").replace("條", "").strip()
+            results = [a for a in results if a["article_no"] == target]
+        if ch != "全部":
+            results = [a for a in results if a["chapter"] == ch]
+        if kw.strip():
+            k = kw.strip()
+            results = [a for a in results if k in a["content"]]
+
+        st.markdown(f"**符合 {len(results)} 條**")
+        for a in results[:50]:
+            with st.expander(f"第 {a['article_no']} 條　·　{a['chapter']}"):
+                for p in a["paragraphs"]:
+                    st.write(p)
+        if len(results) > 50:
+            st.caption(f"… 還有 {len(results) - 50} 條未顯示，請縮小條件")
+
+with law_tab_check:
+    st.subheader("合規訊號偵測（PoC）")
+    st.caption(
+        "對 bids.csv 套用規則，標示可能違反採購法之公開資料訊號。"
+        "**僅供盡職調查參考，非法律結論。**"
+    )
+
+    rule_meta = {
+        "R-058-低價偏離": "§58 總標價偏低（< 80%＝low；< 60%＝high）",
+        "R-087-集中度": "§87 集中度（近 12 月同機關同廠商 ≥ 5 件且 ≥ 70%）",
+        "R-049-小額未公開": "§49 小額限制性（15~150 萬未走公開取得）",
+        "R-033-單一投標": "§33 流標重招（曾無法決標後再決標）",
+        "R-022-限制性": "§22 純限制性招標（請查驗依據款項）",
+    }
+    picked = st.multiselect(
+        "啟用規則",
+        options=list(rule_meta),
+        default=list(rule_meta),
+        format_func=lambda k: rule_meta[k],
+        key="compliance_rules",
+    )
+
+    unit_q = st.text_input("篩選機關（可選）", "", key="compliance_unit")
+
+    if picked:
+        findings = compliance.run_all(df, rule_ids=picked)
+        fdf = compliance.findings_to_df(findings)
+        if unit_q.strip():
+            fdf = fdf[fdf["unit_name"].str.contains(unit_q.strip(), na=False)]
+
+        sev_order = {"high": 0, "mid": 1, "low": 2}
+        if not fdf.empty:
+            fdf = fdf.assign(_sev=fdf["severity"].map(sev_order)).sort_values(
+                ["_sev", "date"], ascending=[True, False]
+            ).drop(columns=["_sev"])
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("總命中", len(fdf))
+        c2.metric("high", int((fdf["severity"] == "high").sum()) if not fdf.empty else 0)
+        c3.metric("mid", int((fdf["severity"] == "mid").sum()) if not fdf.empty else 0)
+
+        if fdf.empty:
+            st.info("沒有命中項目。")
+        else:
+            st.dataframe(fdf, use_container_width=True, hide_index=True)
+    else:
+        st.info("請至少勾選一條規則")
+
+with law_tab_rfi:
+    st.subheader("RFI / 招標文件 合規檢核")
+    st.caption(
+        "上傳 RFI、需求書或招標文件（PDF / DOCX / TXT），系統比對政府採購法常見違規訊號。"
+        "**僅供初篩提示，非法律結論。**"
+    )
+
+    up = st.file_uploader(
+        "上傳文件",
+        type=["pdf", "docx", "txt", "md"],
+        accept_multiple_files=False,
+        key="rfi_upload",
+    )
+    paste = st.text_area(
+        "或直接貼上文字（不上傳檔案時使用）", height=160, key="rfi_paste"
+    )
+
+    text = ""
+    note = ""
+    if up is not None:
+        text, note = rfi_check.extract_text(up.name, up.getvalue())
+        st.caption(f"📄 {up.name} · {note}")
+    elif paste.strip():
+        text = paste
+        note = f"貼上文字 {len(text):,} 字"
+        st.caption(f"📝 {note}")
+
+    if text.strip():
+        findings = rfi_check.run(text)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("總命中", len(findings))
+        c2.metric("high", sum(1 for f in findings if f.severity == "high"))
+        c3.metric("mid", sum(1 for f in findings if f.severity == "mid"))
+        c4.metric("low", sum(1 for f in findings if f.severity == "low"))
+
+        if not findings:
+            st.success("🎉 沒有偵測到明顯違規訊號")
+        else:
+            # 載入條文供 deep-link
+            law = load_law()
+            art_lookup = {a["article_no"]: a for a in (law["articles"] if law else [])}
+            sev_emoji = {"high": "🔴", "mid": "🟡", "low": "🟢"}
+            for f in findings:
+                with st.expander(
+                    f"{sev_emoji.get(f.severity, '⚪')} §{f.article_no} {f.article_title} — {f.rule_id}"
+                ):
+                    st.markdown(f"**建議**：{f.advice}")
+                    st.code(f.snippet, language=None)
+                    art = art_lookup.get(f.article_no)
+                    if art:
+                        st.markdown(f"**第 {art['article_no']} 條（{art['chapter']}）原文**")
+                        for p in art["paragraphs"]:
+                            st.write(p)
+
+        with st.expander("📜 看抽取出來的全文"):
+            st.text_area("文字內容", value=text, height=300, key="rfi_text_preview", disabled=True)
+    elif up is not None and not text:
+        st.warning(note or "無法抽取文字")
+    else:
+        st.info("請上傳檔案或貼上文字以開始檢核")

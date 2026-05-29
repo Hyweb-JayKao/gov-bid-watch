@@ -1,9 +1,17 @@
-"""Streamlit dashboard：政府標案觀測（軟體開發類）。"""
+"""Streamlit dashboard：政府標案觀測（軟體開發類）。
+
+版面：深色頁首 + 左側導覽 + 總覽儀表板 landing + 既有 10 個分析頁。
+設計參考自「政府採購標案得標機會分析」儀表板，但**只保留有真實資料源的面板**
+（移除：平均招標天數 / 採購流程漏斗 / 得標率比較 / 得標關鍵因素 / 得標失標原因 / 縣市地圖，
+這些 g0v 標案 API 無對應欄位，硬做等於假數據）。
+"""
 import json
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 import compliance
@@ -20,10 +28,51 @@ from helpers import (
     is_own,
 )
 
-st.set_page_config(page_title="政府標案觀測", layout="wide")
+st.set_page_config(page_title="政府軟體標案得標機會分析", layout="wide", page_icon="🏛️")
 
 DATA_PATH = "data/bids.csv"
 LAW_PATH = "data/law/procurement_act.json"
+
+# 配色（對齊參考圖：深藍頁首 + 藍綠強調）
+NAVY = "#0B2545"
+NAVY2 = "#13315C"
+ACCENT = "#2E86DE"
+GREEN = "#27AE60"
+
+# ---------- 樣式 ----------
+st.markdown(
+    f"""
+    <style>
+      .block-container {{ padding-top: 1rem; padding-bottom: 2rem; max-width: 100%; }}
+      /* KPI / metric 卡片化 */
+      div[data-testid="stMetric"] {{
+        background: #FFFFFF;
+        border: 1px solid #E6E9EF;
+        border-left: 4px solid {ACCENT};
+        border-radius: 10px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 4px rgba(11,37,69,0.06);
+      }}
+      div[data-testid="stMetricLabel"] p {{ font-size: 0.82rem; color: #5A6473; }}
+      div[data-testid="stMetricValue"] {{ font-size: 1.55rem; color: {NAVY}; font-weight: 700; }}
+      /* 側邊深色 */
+      section[data-testid="stSidebar"] {{ background: {NAVY}; }}
+      section[data-testid="stSidebar"] * {{ color: #E8EDF4; }}
+      /* 頁首 band */
+      .gbw-header {{
+        background: linear-gradient(90deg, {NAVY} 0%, {NAVY2} 100%);
+        color: #fff; border-radius: 12px; padding: 18px 26px; margin-bottom: 14px;
+        display: flex; justify-content: space-between; align-items: center;
+      }}
+      .gbw-header .title {{ font-size: 1.6rem; font-weight: 800; letter-spacing: 1px; }}
+      .gbw-header .subtitle {{ font-size: 0.9rem; opacity: 0.85; margin-top: 2px; }}
+      .gbw-header .meta {{ text-align: right; font-size: 0.85rem; opacity: 0.9; line-height: 1.5; }}
+      .gbw-section {{ font-size: 1.05rem; font-weight: 700; color: {NAVY};
+        border-left: 4px solid {ACCENT}; padding-left: 10px; margin: 4px 0 8px; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 @st.cache_data(ttl=86400)
@@ -44,7 +93,6 @@ def load():
     df["month"] = df["date"].dt.to_period("M").astype(str)
     df["unit_type"] = df["unit_name"].apply(classify_unit)
     # g0v 搬遷後舊 URL 失效 → 改用 Google 搜 job_number + 標題
-    from urllib.parse import quote_plus
     df["url"] = df.apply(
         lambda r: f"https://www.google.com/search?q={quote_plus(str(r['job_number']) + ' ' + str(r['title']))}",
         axis=1,
@@ -61,22 +109,231 @@ except FileNotFoundError:
     st.error(f"找不到資料檔 {DATA_PATH}。等 GitHub Actions 第一次跑完或 push 初始資料後重整。")
     st.stop()
 
-st.title("政府標案觀測（軟體開發類）")
 date_max = df["date"].max()
 date_min = df["date"].min()
 date_span_days = (date_max - date_min).days if pd.notna(date_max) and pd.notna(date_min) else 0
-st.caption(
-    f"資料 {date_min.strftime('%Y-%m-%d') if pd.notna(date_min) else 'N/A'} ~ "
-    f"{date_max.strftime('%Y-%m-%d') if pd.notna(date_max) else 'N/A'} · "
-    f"共 {len(df):,} 筆 · 跨度 {date_span_days} 天"
+
+# ---------- 頁首 ----------
+st.markdown(
+    f"""
+    <div class="gbw-header">
+      <div>
+        <div class="title">🏛️ 政府軟體標案得標機會分析</div>
+        <div class="subtitle">洞察市場趨勢・鎖定投標機會・精準決策（軟體開發類）</div>
+      </div>
+      <div class="meta">
+        資料範圍<br>
+        <b>{date_min.strftime('%Y-%m-%d') if pd.notna(date_min) else 'N/A'} ~ {date_max.strftime('%Y-%m-%d') if pd.notna(date_max) else 'N/A'}</b><br>
+        共 {len(df):,} 筆 · 跨度 {date_span_days} 天
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
-    ["市場", "趨勢", "競爭", "機關", "雷達", "對手查詢", "公司查詢", "清單", "同領域", "法規"]
+# ---------- 左側導覽 ----------
+NAV_ITEMS = ["總覽儀表板", "市場趨勢", "標案趨勢", "廠商競爭", "機關分析",
+             "得標機會雷達", "對手查詢", "公司查詢", "標案清單", "同領域排名", "法規合規"]
+NAV_ICONS = ["speedometer2", "bar-chart", "graph-up", "trophy", "building",
+             "bullseye", "search", "briefcase", "list-ul", "people", "book"]
+
+try:
+    from streamlit_option_menu import option_menu
+    with st.sidebar:
+        st.markdown("### 📊 導覽")
+        selected = option_menu(
+            menu_title=None, options=NAV_ITEMS, icons=NAV_ICONS,
+            default_index=0,
+            styles={
+                "container": {"background-color": NAVY, "padding": "0"},
+                "icon": {"color": "#8FB7E8", "font-size": "16px"},
+                "nav-link": {"color": "#E8EDF4", "font-size": "14px",
+                             "--hover-color": NAVY2},
+                "nav-link-selected": {"background-color": ACCENT, "color": "#fff"},
+            },
+        )
+except ImportError:
+    selected = st.sidebar.radio("📊 導覽", NAV_ITEMS, index=0)
+
+st.sidebar.divider()
+st.sidebar.caption(
+    "資料源：g0v 標案瀏覽器 API\n\n"
+    f"自家識別：{'、'.join(OWN_COMPANIES[:3])}…"
 )
 
-# ---------- 市場 ----------
-with tab1:
+
+# =================================================================
+# 總覽儀表板（landing）— 只放有真實資料源的面板
+# =================================================================
+def _delta(now, prev):
+    """prev=0 時不顯示 delta。"""
+    if prev == 0:
+        return None
+    return f"{(now - prev) / prev * 100:+.1f}%"
+
+
+if selected == "總覽儀表板":
+    # --- 篩選列（取代參考圖右側 filter rail）---
+    with st.expander("🔎 篩選條件", expanded=False):
+        f1, f2, f3 = st.columns(3)
+        dr = f1.date_input("公告日期", value=(date_min, date_max), key="ov_date")
+        utypes = sorted(df["unit_type"].dropna().unique().tolist())
+        pick_ut = f2.multiselect("機關類型", utypes, key="ov_ut")
+        cats = df["category"].dropna().value_counts().head(20).index.tolist()
+        pick_cat = f3.multiselect("標案分類", cats, key="ov_cat")
+
+    fdf = df.copy()
+    if isinstance(dr, tuple) and len(dr) == 2:
+        fdf = fdf[(fdf["date"] >= pd.Timestamp(dr[0])) & (fdf["date"] <= pd.Timestamp(dr[1]))]
+    if pick_ut:
+        fdf = fdf[fdf["unit_type"].isin(pick_ut)]
+    if pick_cat:
+        fdf = fdf[fdf["category"].isin(pick_cat)]
+
+    award = fdf[fdf["type"].str.contains("決標", na=False) & fdf["award_amount"].notna()]
+    notice = fdf[~fdf["type"].str.contains("決標", na=False)]
+
+    # 近 90 天 vs 前 90 天（honest period-over-period）
+    if pd.notna(date_max):
+        cut1 = date_max - pd.Timedelta(days=90)
+        cut2 = date_max - pd.Timedelta(days=180)
+        aw_now = award[award["date"] > cut1]
+        aw_prev = award[(award["date"] > cut2) & (award["date"] <= cut1)]
+        nt_now = fdf[fdf["date"] > cut1]
+        nt_prev = fdf[(fdf["date"] > cut2) & (fdf["date"] <= cut1)]
+    else:
+        aw_now = aw_prev = nt_now = nt_prev = fdf.iloc[0:0]
+
+    def _winners(d):
+        s = d["companies"].dropna().str.split("|").explode().str.strip()
+        return s[s != ""].nunique()
+
+    st.markdown('<div class="gbw-section">關鍵指標（delta = 近 90 天 vs 前 90 天）</div>', unsafe_allow_html=True)
+    k1, k2, k3, k4 = st.columns(4)
+    total_amt = award["award_amount"].sum()
+    k1.metric("決標總金額（億）", f"{total_amt / 1e8:,.1f}",
+              _delta(aw_now["award_amount"].sum(), aw_prev["award_amount"].sum()))
+    k2.metric("決標筆數", f"{len(award):,}", _delta(len(aw_now), len(aw_prev)))
+    k3.metric("平均單案（萬）", f"{(award['award_amount'].mean() / 1e4):,.0f}" if len(award) else "—")
+    k4.metric("公告/招標案件", f"{len(notice):,}", _delta(len(nt_now), len(nt_prev)))
+
+    k5, k6, k7, k8 = st.columns(4)
+    k5.metric("得標廠商數", f"{_winners(award):,}", help="g0v 資料僅含得標者，非全部投標者")
+    k6.metric("機關數", f"{fdf['unit_name'].nunique():,}")
+    own_award = award[award["companies"].fillna("").apply(lambda s: any(k in s for k in OWN_COMPANIES))]
+    k7.metric("凌網得標案", f"{len(own_award):,}", help="OWN_COMPANIES 命中")
+    k8.metric("凌網得標額（億）", f"{own_award['award_amount'].sum() / 1e8:.2f}")
+
+    st.divider()
+
+    # --- 趨勢 + 類別 ---
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown('<div class="gbw-section">標案公告趨勢（月）</div>', unsafe_allow_html=True)
+        m = fdf.dropna(subset=["date"]).copy()
+        m["類別"] = m["type"].apply(lambda t: "決標公告" if "決標" in str(t) else "招標公告")
+        trend = m.groupby(["month", "類別"]).size().reset_index(name="件數")
+        if len(trend):
+            fig = px.line(trend, x="month", y="件數", color="類別", markers=True,
+                          color_discrete_map={"招標公告": ACCENT, "決標公告": GREEN})
+            fig.update_layout(height=340, legend=dict(orientation="h", y=1.12),
+                              margin=dict(t=10, b=0, l=0, r=0))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("無資料")
+    with c2:
+        st.markdown('<div class="gbw-section">標案分類分布（依分類件數）</div>', unsafe_allow_html=True)
+        if fdf["category"].notna().any():
+            cat_cnt = fdf["category"].value_counts().head(6).reset_index()
+            cat_cnt.columns = ["分類", "件數"]
+            fig = px.pie(cat_cnt, names="分類", values="件數", hole=0.5)
+            fig.update_layout(height=340, margin=dict(t=10, b=0, l=0, r=0),
+                              legend=dict(orientation="h", y=-0.1, font=dict(size=10)))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("無分類資料")
+
+    st.divider()
+
+    # --- 廠商排行 + 金額級距 ---
+    c3, c4 = st.columns([3, 2])
+    with c3:
+        st.markdown('<div class="gbw-section">得標廠商排行榜（依得標金額・紅=凌網）</div>', unsafe_allow_html=True)
+        aw_c = award[award["companies"].notna()].copy()
+        if len(aw_c):
+            aw_c["company"] = aw_c["companies"].str.split("|")
+            ex = aw_c.explode("company")
+            ex["company"] = ex["company"].str.strip()
+            rank = ex.groupby("company").agg(
+                得標件數=("job_number", "count"),
+                得標金額=("award_amount", "sum"),
+            ).sort_values("得標金額", ascending=False).head(10).reset_index()
+            rank["得標金額（億）"] = (rank["得標金額"] / 1e8).round(2)
+            rank["自家"] = rank["company"].apply(is_own)
+            colors = [HIGHLIGHT_COLOR if o else ACCENT for o in rank["自家"]]
+            fig = go.Figure(go.Bar(
+                x=rank["得標金額（億）"], y=rank["company"], orientation="h",
+                marker_color=colors, text=rank["得標金額（億）"], textposition="outside",
+            ))
+            fig.update_layout(height=380, margin=dict(t=10, b=0, l=0, r=10),
+                              yaxis=dict(autorange="reversed"), xaxis_title="得標金額（億）")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("無決標廠商資料")
+    with c4:
+        st.markdown('<div class="gbw-section">標案金額級距分布</div>', unsafe_allow_html=True)
+        if len(award):
+            bins = [0, 1e6, 5e6, 1e7, 5e7, 1e8, 1e10]
+            labels = ["<100萬", "100-500萬", "500-1000萬", "1000-5000萬", "5000萬-1億", ">1億"]
+            bucket = pd.cut(award["award_amount"], bins=bins, labels=labels)
+            dist = bucket.value_counts().reindex(labels).reset_index()
+            dist.columns = ["級距", "案數"]
+            fig = px.bar(dist, x="級距", y="案數", text="案數")
+            fig.update_traces(marker_color=ACCENT)
+            fig.update_layout(height=380, margin=dict(t=10, b=0, l=0, r=0), xaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("無金額資料")
+
+    st.divider()
+
+    # --- 需求主題 + 機關類型 ---
+    c5, c6 = st.columns(2)
+    with c5:
+        st.markdown('<div class="gbw-section">需求主題金額分布（取代「得標關鍵因素」）</div>', unsafe_allow_html=True)
+        if len(award):
+            rows = []
+            for theme, kws in DEMAND_THEMES.items():
+                mk = award["title"].fillna("").apply(lambda t: any(k in t for k in kws))
+                if mk.sum():
+                    rows.append({"主題": theme, "金額(億)": award.loc[mk, "award_amount"].sum() / 1e8, "案數": int(mk.sum())})
+            if rows:
+                tdf = pd.DataFrame(rows).sort_values("金額(億)", ascending=True).tail(10)
+                fig = px.bar(tdf, x="金額(億)", y="主題", orientation="h", hover_data=["案數"],
+                             text=tdf["金額(億)"].round(2))
+                fig.update_traces(marker_color=GREEN)
+                fig.update_layout(height=360, margin=dict(t=10, b=0, l=0, r=10))
+                st.plotly_chart(fig, use_container_width=True)
+    with c6:
+        st.markdown('<div class="gbw-section">機關類型分布（取代「縣市地圖」）</div>', unsafe_allow_html=True)
+        ta = fdf.groupby("unit_type").agg(案件數=("job_number", "count")).sort_values("案件數", ascending=False)
+        if len(ta):
+            fig = px.bar(ta.reset_index(), x="案件數", y="unit_type", orientation="h", text="案件數")
+            fig.update_traces(marker_color=ACCENT)
+            fig.update_layout(height=360, margin=dict(t=10, b=0, l=0, r=10),
+                              yaxis=dict(autorange="reversed", title=""))
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.caption("⚠️ 資料來自 g0v 標案瀏覽器 API（公開資料），僅供市場觀測參考，實際以政府電子採購網公告為準。"
+               "已移除無資料源面板（招標天數 / 採購漏斗 / 得標率比較 / 得標關鍵因素 / 失標原因 / 縣市地圖）。")
+
+
+# =================================================================
+# 以下為既有分析頁（由左側 nav 切換，每次只算當前頁）
+# =================================================================
+
+# ---------- 市場趨勢 ----------
+elif selected == "市場趨勢":
     st.subheader("市場大小")
     award = df[df["type"].str.contains("決標", na=False) & df["award_amount"].notna()]
 
@@ -154,8 +411,8 @@ with tab1:
     else:
         st.info("尚無金額資料")
 
-# ---------- 趨勢 ----------
-with tab2:
+# ---------- 標案趨勢 ----------
+elif selected == "標案趨勢":
     st.subheader("分類月度環比成長（Top 10）")
     if "category" in df.columns and df["category"].notna().any():
         cat_month = df.groupby(["category", "month"]).size().unstack(fill_value=0)
@@ -197,8 +454,8 @@ with tab2:
     fig.update_xaxes(tickmode="array", tickvals=list(range(1, 13)), ticktext=[f"{m}月" for m in range(1, 13)])
     st.plotly_chart(fig, use_container_width=True)
 
-# ---------- 競爭 ----------
-with tab3:
+# ---------- 廠商競爭 ----------
+elif selected == "廠商競爭":
     award_all = df[df["type"].str.contains("決標", na=False) & df["companies"].notna()].copy()
     if len(award_all):
         award_all["company"] = award_all["companies"].str.split("|")
@@ -237,17 +494,14 @@ with tab3:
         st.subheader("廠商 Top 20（紅色=凌網）")
         top20 = agg.head(20).reset_index()
         colors = [HIGHLIGHT_COLOR if row["自家"] else "#4A90E2" for _, row in top20.iterrows()]
-        import plotly.graph_objects as go
         fig = go.Figure(go.Bar(
             x=top20["次數"], y=top20["company"], orientation="h",
             marker_color=colors,
             text=top20["次數"], textposition="outside",
         ))
-        # y 軸字色：凌網紅、其他預設
-        tick_colors = [HIGHLIGHT_COLOR if own else "#CCCCCC" for own in top20["自家"]]
         fig.update_yaxes(
             categoryorder="array",
-            categoryarray=top20["company"].tolist()[::-1],  # 反轉使最大在上
+            categoryarray=top20["company"].tolist()[::-1],
         )
         fig.update_layout(
             yaxis=dict(
@@ -267,7 +521,6 @@ with tab3:
         if company:
             sub = exploded[exploded["company"] == company].sort_values("date", ascending=False)
 
-            # Summary
             total_amt = sub["award_amount"].sum()
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("承接案數", f"{len(sub):,}")
@@ -320,8 +573,8 @@ with tab3:
     else:
         st.info("尚無決標資料")
 
-# ---------- 機關 ----------
-with tab4:
+# ---------- 機關分析 ----------
+elif selected == "機關分析":
     st.subheader("機關類型分布")
     type_agg = df.groupby("unit_type").agg(
         案件數=("job_number", "count"),
@@ -375,7 +628,6 @@ with tab4:
                 金額=("award_amount", "sum"),
             ).sort_values("案數", ascending=False)
             agg_v["金額（萬）"] = (agg_v["金額"] / 1e4).round(0).astype(int)
-            # 算各廠商在「整體資料」裡的擅長領域（依 demand theme 命中）
             all_aw = df[df["type"].str.contains("決標", na=False) & df["companies"].notna()].copy()
             all_aw["company"] = all_aw["companies"].str.split("|")
             all_exp = all_aw.explode("company")
@@ -406,7 +658,6 @@ with tab4:
         else:
             st.caption("無命中主題")
 
-        # 凌網在此機關的表現
         own_here = sub[sub["companies"].fillna("").apply(lambda s: any(k in s for k in OWN_COMPANIES))]
         if len(own_here):
             st.success(f"🎯 凌網在此機關承接 {len(own_here)} 案，總金額 {own_here['award_amount'].sum() / 1e4:,.0f} 萬")
@@ -428,8 +679,8 @@ with tab4:
     ).sort_values("案件數", ascending=False).head(50)
     st.dataframe(unit_agg, use_container_width=True)
 
-# ---------- 雷達 ----------
-with tab5:
+# ---------- 得標機會雷達 ----------
+elif selected == "得標機會雷達":
     st.subheader("🎯 機會雷達（O+R 可投的標案）")
     st.caption("鎖定強項關鍵字 + Watch List 機關，區分「招標中可投」與「已被誰拿走」")
 
@@ -443,22 +694,20 @@ with tab5:
     min_amt_wan = col2.number_input("最小金額（萬）", value=200, step=100)
     use_watchlist = col3.checkbox("只看 Watch List 機關", value=False)
 
-    # 套用篩選
     kws = [k for s in picked_strengths for k in STRENGTH_KEYWORDS[s]]
     radar = df.copy()
     if kws:
         radar = radar[radar["title"].fillna("").apply(lambda t: any(k in t for k in kws))]
     if use_watchlist:
         radar = radar[radar["unit_name"].fillna("").apply(lambda u: any(w in u for w in WATCH_UNITS))]
-    # 金額門檻：對招標中無金額的用 budget，已決標的用 award_amount
+
     def passes_amount(row):
         amt = row["award_amount"] if pd.notna(row["award_amount"]) else row["budget"]
         if pd.isna(amt):
-            return True  # 沒金額資訊的暫時保留（招標中未公告金額）
+            return True
         return amt >= min_amt_wan * 10000
     radar = radar[radar.apply(passes_amount, axis=1)]
 
-    # 分「招標中」與「已決標」
     in_tender = radar[radar["type"].str.contains("公開招標|限制性招標|公開取得", na=False)]
     awarded = radar[radar["type"] == "決標公告"]
 
@@ -498,7 +747,7 @@ with tab5:
         st.dataframe(rival, use_container_width=True)
 
 # ---------- 對手查詢 ----------
-with tab6:
+elif selected == "對手查詢":
     st.subheader("🔎 對手查詢（業務用）")
     st.caption("評估案子時用：輸入標題關鍵字 或 機關名稱，查誰做過類似 / 服務過這個機關")
 
@@ -521,12 +770,10 @@ with tab6:
         st.caption(f"命中 {len(matched):,} 筆")
 
         if len(matched):
-            # 命中機關
             unit_hits = matched["unit_name"].value_counts()
             st.markdown(f"**命中機關**（{unit_hits.shape[0]} 個）")
             st.dataframe(unit_hits.rename("案數").head(30), use_container_width=True)
 
-            # 競爭廠商（只有決標類有 company）
             vend = matched[matched["companies"].notna()].copy()
             if len(vend):
                 vend["company"] = vend["companies"].str.split("|")
@@ -552,7 +799,7 @@ with tab6:
         st.info("輸入標題關鍵字或機關關鍵字後顯示結果")
 
 # ---------- 公司查詢 ----------
-with tab7:
+elif selected == "公司查詢":
     st.subheader("🏢 公司查詢（過去 12 個月得標）")
     st.caption("投標前快查：輸入公司名（部分即可）→ 該公司在資料集最新日往前 365 天內的所有決標案")
 
@@ -616,8 +863,8 @@ with tab7:
                 },
             )
 
-# ---------- 清單 ----------
-with tab8:
+# ---------- 標案清單 ----------
+elif selected == "標案清單":
     col1, col2, col3 = st.columns(3)
     types = col1.multiselect("類型", df["type"].dropna().unique())
     kw = col2.text_input("標題關鍵字")
@@ -646,8 +893,8 @@ with tab8:
         column_config={"url": st.column_config.LinkColumn("連結")},
     )
 
-# ---------- 同領域對手排名 ----------
-with tab9:
+# ---------- 同領域排名 ----------
+elif selected == "同領域排名":
     st.subheader("同領域對手排名")
     st.caption("輸入關鍵字（比對 title），看近 12 個月該領域誰是老大、自家排第幾")
     kw9 = st.text_input("關鍵字", placeholder="例：圖書館、資安、AI、無障礙")
@@ -703,164 +950,163 @@ with tab9:
         else:
             st.info(f"近 12 個月內無「{kw9}」相關決標案件")
 
-# ---------- 法規 ----------
-with tab10:
+# ---------- 法規合規 ----------
+elif selected == "法規合規":
     law_tab_articles, law_tab_check, law_tab_rfi = st.tabs(
         ["條文查詢", "合規查核 (已決標案)", "RFI 文件檢核"]
     )
 
-with law_tab_articles:
-    st.subheader("政府採購法條文")
-    law = load_law()
-    if not law:
-        st.warning(
-            f"找不到 `{LAW_PATH}`。請執行 `python scripts/fetch_law.py` 產生。"
-        )
-    else:
+    with law_tab_articles:
+        st.subheader("政府採購法條文")
+        law = load_law()
+        if not law:
+            st.warning(
+                f"找不到 `{LAW_PATH}`。請執行 `python scripts/fetch_law.py` 產生。"
+            )
+        else:
+            st.caption(
+                f"{law['law_name']}（{law['law_code']}）· "
+                f"修正日期 {law['amended_date']} · 共 {law['article_count']} 條 · "
+                f"[來源]({law['source_url']}) · 抓取時間 {law['fetched_at']}"
+            )
+
+            chapters = []
+            seen = set()
+            for a in law["articles"]:
+                if a["chapter"] and a["chapter"] not in seen:
+                    seen.add(a["chapter"])
+                    chapters.append(a["chapter"])
+
+            c1, c2, c3 = st.columns([2, 2, 1])
+            with c1:
+                kw = st.text_input("關鍵字（搜全文）", "", key="law_kw")
+            with c2:
+                ch = st.selectbox("章節", ["全部"] + chapters, key="law_chapter")
+            with c3:
+                art_no = st.text_input("條號（精確）", "", key="law_no", placeholder="例：26-2")
+
+            results = law["articles"]
+            if art_no.strip():
+                target = art_no.strip().replace("第", "").replace("條", "").strip()
+                results = [a for a in results if a["article_no"] == target]
+            if ch != "全部":
+                results = [a for a in results if a["chapter"] == ch]
+            if kw.strip():
+                k = kw.strip()
+                results = [a for a in results if k in a["content"]]
+
+            st.markdown(f"**符合 {len(results)} 條**")
+            for a in results[:50]:
+                with st.expander(f"第 {a['article_no']} 條　·　{a['chapter']}"):
+                    for p in a["paragraphs"]:
+                        st.write(p)
+            if len(results) > 50:
+                st.caption(f"… 還有 {len(results) - 50} 條未顯示，請縮小條件")
+
+    with law_tab_check:
+        st.subheader("合規訊號偵測（PoC）")
         st.caption(
-            f"{law['law_name']}（{law['law_code']}）· "
-            f"修正日期 {law['amended_date']} · 共 {law['article_count']} 條 · "
-            f"[來源]({law['source_url']}) · 抓取時間 {law['fetched_at']}"
+            "對 bids.csv 套用規則，標示可能違反採購法之公開資料訊號。"
+            "**僅供盡職調查參考，非法律結論。**"
         )
 
-        chapters = []
-        seen = set()
-        for a in law["articles"]:
-            if a["chapter"] and a["chapter"] not in seen:
-                seen.add(a["chapter"])
-                chapters.append(a["chapter"])
+        rule_meta = {
+            "R-058-低價偏離": "§58 總標價偏低（< 80%＝low；< 60%＝high）",
+            "R-087-集中度": "§87 集中度（近 12 月同機關同廠商 ≥ 5 件且 ≥ 70%）",
+            "R-049-小額未公開": "§49 小額限制性（15~150 萬未走公開取得）",
+            "R-033-單一投標": "§33 流標重招（曾無法決標後再決標）",
+            "R-022-限制性": "§22 純限制性招標（請查驗依據款項）",
+        }
+        picked = st.multiselect(
+            "啟用規則",
+            options=list(rule_meta),
+            default=list(rule_meta),
+            format_func=lambda k: rule_meta[k],
+            key="compliance_rules",
+        )
 
-        c1, c2, c3 = st.columns([2, 2, 1])
-        with c1:
-            kw = st.text_input("關鍵字（搜全文）", "", key="law_kw")
-        with c2:
-            ch = st.selectbox("章節", ["全部"] + chapters, key="law_chapter")
-        with c3:
-            art_no = st.text_input("條號（精確）", "", key="law_no", placeholder="例：26-2")
+        unit_q = st.text_input("篩選機關（可選）", "", key="compliance_unit")
 
-        results = law["articles"]
-        if art_no.strip():
-            target = art_no.strip().replace("第", "").replace("條", "").strip()
-            results = [a for a in results if a["article_no"] == target]
-        if ch != "全部":
-            results = [a for a in results if a["chapter"] == ch]
-        if kw.strip():
-            k = kw.strip()
-            results = [a for a in results if k in a["content"]]
+        if picked:
+            findings = compliance.run_all(df, rule_ids=picked)
+            fdf = compliance.findings_to_df(findings)
+            if unit_q.strip():
+                fdf = fdf[fdf["unit_name"].str.contains(unit_q.strip(), na=False)]
 
-        st.markdown(f"**符合 {len(results)} 條**")
-        for a in results[:50]:
-            with st.expander(f"第 {a['article_no']} 條　·　{a['chapter']}"):
-                for p in a["paragraphs"]:
-                    st.write(p)
-        if len(results) > 50:
-            st.caption(f"… 還有 {len(results) - 50} 條未顯示，請縮小條件")
+            sev_order = {"high": 0, "mid": 1, "low": 2}
+            if not fdf.empty:
+                fdf = fdf.assign(_sev=fdf["severity"].map(sev_order)).sort_values(
+                    ["_sev", "date"], ascending=[True, False]
+                ).drop(columns=["_sev"])
 
-with law_tab_check:
-    st.subheader("合規訊號偵測（PoC）")
-    st.caption(
-        "對 bids.csv 套用規則，標示可能違反採購法之公開資料訊號。"
-        "**僅供盡職調查參考，非法律結論。**"
-    )
+            c1, c2, c3 = st.columns(3)
+            c1.metric("總命中", len(fdf))
+            c2.metric("high", int((fdf["severity"] == "high").sum()) if not fdf.empty else 0)
+            c3.metric("mid", int((fdf["severity"] == "mid").sum()) if not fdf.empty else 0)
 
-    rule_meta = {
-        "R-058-低價偏離": "§58 總標價偏低（< 80%＝low；< 60%＝high）",
-        "R-087-集中度": "§87 集中度（近 12 月同機關同廠商 ≥ 5 件且 ≥ 70%）",
-        "R-049-小額未公開": "§49 小額限制性（15~150 萬未走公開取得）",
-        "R-033-單一投標": "§33 流標重招（曾無法決標後再決標）",
-        "R-022-限制性": "§22 純限制性招標（請查驗依據款項）",
-    }
-    picked = st.multiselect(
-        "啟用規則",
-        options=list(rule_meta),
-        default=list(rule_meta),
-        format_func=lambda k: rule_meta[k],
-        key="compliance_rules",
-    )
-
-    unit_q = st.text_input("篩選機關（可選）", "", key="compliance_unit")
-
-    if picked:
-        findings = compliance.run_all(df, rule_ids=picked)
-        fdf = compliance.findings_to_df(findings)
-        if unit_q.strip():
-            fdf = fdf[fdf["unit_name"].str.contains(unit_q.strip(), na=False)]
-
-        sev_order = {"high": 0, "mid": 1, "low": 2}
-        if not fdf.empty:
-            fdf = fdf.assign(_sev=fdf["severity"].map(sev_order)).sort_values(
-                ["_sev", "date"], ascending=[True, False]
-            ).drop(columns=["_sev"])
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("總命中", len(fdf))
-        c2.metric("high", int((fdf["severity"] == "high").sum()) if not fdf.empty else 0)
-        c3.metric("mid", int((fdf["severity"] == "mid").sum()) if not fdf.empty else 0)
-
-        if fdf.empty:
-            st.info("沒有命中項目。")
+            if fdf.empty:
+                st.info("沒有命中項目。")
+            else:
+                st.dataframe(fdf, use_container_width=True, hide_index=True)
         else:
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
-    else:
-        st.info("請至少勾選一條規則")
+            st.info("請至少勾選一條規則")
 
-with law_tab_rfi:
-    st.subheader("RFI / 招標文件 合規檢核")
-    st.caption(
-        "上傳 RFI、需求書或招標文件（PDF / DOCX / TXT），系統比對政府採購法常見違規訊號。"
-        "**僅供初篩提示，非法律結論。**"
-    )
+    with law_tab_rfi:
+        st.subheader("RFI / 招標文件 合規檢核")
+        st.caption(
+            "上傳 RFI、需求書或招標文件（PDF / DOCX / TXT），系統比對政府採購法常見違規訊號。"
+            "**僅供初篩提示，非法律結論。**"
+        )
 
-    up = st.file_uploader(
-        "上傳文件",
-        type=["pdf", "docx", "txt", "md"],
-        accept_multiple_files=False,
-        key="rfi_upload",
-    )
-    paste = st.text_area(
-        "或直接貼上文字（不上傳檔案時使用）", height=160, key="rfi_paste"
-    )
+        up = st.file_uploader(
+            "上傳文件",
+            type=["pdf", "docx", "txt", "md"],
+            accept_multiple_files=False,
+            key="rfi_upload",
+        )
+        paste = st.text_area(
+            "或直接貼上文字（不上傳檔案時使用）", height=160, key="rfi_paste"
+        )
 
-    text = ""
-    note = ""
-    if up is not None:
-        text, note = rfi_check.extract_text(up.name, up.getvalue())
-        st.caption(f"📄 {up.name} · {note}")
-    elif paste.strip():
-        text = paste
-        note = f"貼上文字 {len(text):,} 字"
-        st.caption(f"📝 {note}")
+        text = ""
+        note = ""
+        if up is not None:
+            text, note = rfi_check.extract_text(up.name, up.getvalue())
+            st.caption(f"📄 {up.name} · {note}")
+        elif paste.strip():
+            text = paste
+            note = f"貼上文字 {len(text):,} 字"
+            st.caption(f"📝 {note}")
 
-    if text.strip():
-        findings = rfi_check.run(text)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("總命中", len(findings))
-        c2.metric("high", sum(1 for f in findings if f.severity == "high"))
-        c3.metric("mid", sum(1 for f in findings if f.severity == "mid"))
-        c4.metric("low", sum(1 for f in findings if f.severity == "low"))
+        if text.strip():
+            findings = rfi_check.run(text)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("總命中", len(findings))
+            c2.metric("high", sum(1 for f in findings if f.severity == "high"))
+            c3.metric("mid", sum(1 for f in findings if f.severity == "mid"))
+            c4.metric("low", sum(1 for f in findings if f.severity == "low"))
 
-        if not findings:
-            st.success("🎉 沒有偵測到明顯違規訊號")
+            if not findings:
+                st.success("🎉 沒有偵測到明顯違規訊號")
+            else:
+                law = load_law()
+                art_lookup = {a["article_no"]: a for a in (law["articles"] if law else [])}
+                sev_emoji = {"high": "🔴", "mid": "🟡", "low": "🟢"}
+                for f in findings:
+                    with st.expander(
+                        f"{sev_emoji.get(f.severity, '⚪')} §{f.article_no} {f.article_title} — {f.rule_id}"
+                    ):
+                        st.markdown(f"**建議**：{f.advice}")
+                        st.code(f.snippet, language=None)
+                        art = art_lookup.get(f.article_no)
+                        if art:
+                            st.markdown(f"**第 {art['article_no']} 條（{art['chapter']}）原文**")
+                            for p in art["paragraphs"]:
+                                st.write(p)
+
+            with st.expander("📜 看抽取出來的全文"):
+                st.text_area("文字內容", value=text, height=300, key="rfi_text_preview", disabled=True)
+        elif up is not None and not text:
+            st.warning(note or "無法抽取文字")
         else:
-            # 載入條文供 deep-link
-            law = load_law()
-            art_lookup = {a["article_no"]: a for a in (law["articles"] if law else [])}
-            sev_emoji = {"high": "🔴", "mid": "🟡", "low": "🟢"}
-            for f in findings:
-                with st.expander(
-                    f"{sev_emoji.get(f.severity, '⚪')} §{f.article_no} {f.article_title} — {f.rule_id}"
-                ):
-                    st.markdown(f"**建議**：{f.advice}")
-                    st.code(f.snippet, language=None)
-                    art = art_lookup.get(f.article_no)
-                    if art:
-                        st.markdown(f"**第 {art['article_no']} 條（{art['chapter']}）原文**")
-                        for p in art["paragraphs"]:
-                            st.write(p)
-
-        with st.expander("📜 看抽取出來的全文"):
-            st.text_area("文字內容", value=text, height=300, key="rfi_text_preview", disabled=True)
-    elif up is not None and not text:
-        st.warning(note or "無法抽取文字")
-    else:
-        st.info("請上傳檔案或貼上文字以開始檢核")
+            st.info("請上傳檔案或貼上文字以開始檢核")

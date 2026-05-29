@@ -97,8 +97,15 @@ def load():
         lambda r: f"https://www.google.com/search?q={quote_plus(str(r['job_number']) + ' ' + str(r['title']))}",
         axis=1,
     )
-    # 過濾：有 category 的必須符合 IT 白名單；category 空的保留（多半是非決標/無詳情）
-    mask = df["category"].fillna("").apply(lambda c: (c == "") or bool(IT_CATEGORY_RE.match(c)))
+    # 過濾（schema 相容兩種資料源）：
+    #  - 舊 g0v：category 是細分碼（勞務類84x / 財物類452）→ 走 IT_CATEGORY_RE 白名單
+    #  - 新 pcc-tender：category 是粗分類（勞務類 / 財物類），軟體篩選已在 fetch_pcc.py
+    #    用關鍵字 + 黑名單做完 → 這裡直接放行粗分類
+    #  - category 空的保留（非決標 / 無詳情）
+    COARSE_ATTR = {"勞務類", "財物類"}
+    mask = df["category"].fillna("").apply(
+        lambda c: (c == "") or (c in COARSE_ATTR) or bool(IT_CATEGORY_RE.match(c))
+    )
     df = df[mask].reset_index(drop=True)
     return df
 

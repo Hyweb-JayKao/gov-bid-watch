@@ -39,7 +39,44 @@ g0v API (pcc-api.openfun.app) Cloudflare 擋 GitHub Actions IP 段回 403，
 
 ## 資料來源
 
-[g0v 標案瀏覽器 API](https://pcc-api.openfun.app/)（原 pcc.g0v.ronny.tw 已搬遷）。
+**兩套並存（遷移中）**：
+
+1. **g0v 標案瀏覽器 API**（現役）— [pcc-api.openfun.app](https://pcc-api.openfun.app/)，
+   `scripts/fetch_bids.py`。痛點：Cloudflare 擋 Actions IP、僅約 16 個月資料。
+2. **TwinkleAI pcc-tender**（新，`scripts/fetch_pcc.py`）— 行政院公共工程委員會
+   政府電子採購網 web.pcc.gov.tw 官方半月公開資料 mirror，**2015→今、16 萬+ 筆、21 欄、無 403**。
+
+### 切換到 pcc-tender（fetch_pcc.py）
+
+純 HTTP（JSON-RPC over SSE）打 TwinkleAI MCP endpoint，**不依賴 Claude Code**，
+launchd 可直接跑。token 走環境變數 `TWINKLE_API_KEY`（不寫死、不進 git）。
+
+```bash
+export TWINKLE_API_KEY=sk-xxxx
+# 週度增量
+python scripts/fetch_pcc.py --days 14 --out data/weekly.csv
+python scripts/merge.py --weekly data/weekly.csv
+# 一次性 backfill（11 年）
+python scripts/fetch_pcc.py --since 2015-04-01 --out data/bids_full.csv
+```
+
+輸出 schema 對齊 bids.csv，外加 pcc 欄位：`notice_date / award_way / county /
+county_code / town_code / contact_person / contact_phone / losing_supplier`。
+
+> ⚠️ **遷移注意（實測）**：
+> - pcc 無「預算金額」欄 → 招標公告無金額（雷達招標中不能用金額篩）
+> - `category` 只有粗分類（勞務類/財物類）→ 軟體篩選靠 `fetch_pcc.py` 的關鍵字+黑名單；
+>   `app.py load()` 已放行粗分類
+> - `county_code` 僅決標公告有（縣市分析限決標）；`detail_url` 多空（退回 Google）；
+>   `losing_supplier`（未得標廠商）填充率低，無法穩定推「真得標率」
+> - 切換時 `bids.csv` 不會被自動覆蓋；backfill 產生新檔、人工確認後再 rename / merge
+
+## 過濾規則
+
+- **正向關鍵字**：系統、軟體、資訊、網站、APP、平台/平臺、維運、數位、雲端、AI...
+- **黑名單**：工程、營造、建築、道路、橋樑、管線...（排除土木/建築類誤抓）
+- **分類白名單**：g0v 用細分碼 `勞務類*`+`財物類4*`；pcc 用粗分類 `勞務類`+`財物類`
+  （`KEYWORDS`/`BLACKLIST` 兩 fetcher 共用，定義在 `fetch_bids.py`）
 
 ## 過濾規則
 

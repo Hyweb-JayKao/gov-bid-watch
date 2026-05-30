@@ -151,9 +151,9 @@ st.markdown(
 )
 
 # ---------- 左側導覽 ----------
-NAV_ITEMS = ["總覽儀表板", "市場趨勢", "標案趨勢", "廠商競爭", "機關分析",
+NAV_ITEMS = ["總覽儀表板", "市場趨勢", "標案趨勢", "廠商競爭", "機關分析", "關聯查詢",
              "得標機會雷達", "對手查詢", "公司查詢", "標案清單", "同領域排名", "法規合規"]
-NAV_ICONS = ["speedometer2", "bar-chart", "graph-up", "trophy", "building",
+NAV_ICONS = ["speedometer2", "bar-chart", "graph-up", "trophy", "building", "diagram-3",
              "bullseye", "search", "briefcase", "list-ul", "people", "book"]
 
 try:
@@ -697,6 +697,85 @@ elif selected == "機關分析":
         總預算=("budget", "sum"),
     ).sort_values("案件數", ascending=False).head(50)
     st.dataframe(unit_agg, use_container_width=True)
+
+# ---------- 關聯查詢（機關 ↔ 廠商 雙向視圖，issue #13）----------
+elif selected == "關聯查詢":
+    st.subheader("🔗 關聯查詢（機關 ↔ 廠商 雙向視圖）")
+    st.caption("同一份決標資料的兩種視角：選機關看誰在服務，或查廠商看它服務哪些機關。共用欄位：時間｜廠商｜機關｜金額")
+
+    # 決標 + 有金額 + 有廠商 → 展開聯合承攬
+    base = df[df["type"].str.contains("決標", na=False) & df["companies"].notna()].copy()
+    base = base[base["companies"].str.strip() != ""]
+    base["company"] = base["companies"].str.split("|")
+    ex = base.explode("company")
+    ex["company"] = ex["company"].str.strip()
+    ex = ex[ex["company"] != ""]
+
+    DETAIL_COLS = {"date": "時間", "company": "廠商", "unit_name": "機關", "award_amount": "金額"}
+
+    def _detail(sub):
+        d = sub[["date", "company", "unit_name", "award_amount", "url"]].sort_values("date", ascending=False)
+        return d.rename(columns=DETAIL_COLS)
+
+    mode = st.radio("視角", ["機關 → 看服務廠商", "廠商 → 看服務機關"], horizontal=True)
+
+    if mode == "機關 → 看服務廠商":
+        units = sorted(ex["unit_name"].dropna().unique().tolist())
+        unit = st.selectbox(f"選機關（共 {len(units):,} 個，可輸入關鍵字搜尋）", [""] + units)
+        if unit:
+            sub = ex[ex["unit_name"] == unit]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("服務廠商數", f"{sub['company'].nunique():,}")
+            c2.metric("決標案數", f"{len(sub):,}")
+            c3.metric("決標總額（億）", f"{sub['award_amount'].sum() / 1e8:.2f}")
+
+            st.markdown(f"**服務「{unit}」的廠商**")
+            agg = sub.groupby("company").agg(
+                案數=("job_number", "count"),
+                總金額=("award_amount", "sum"),
+            ).sort_values("總金額", ascending=False).reset_index()
+            agg["總金額（萬）"] = (agg["總金額"].fillna(0) / 1e4).round(0).astype(int)
+            agg["自家"] = agg["company"].apply(is_own)
+            agg = agg.rename(columns={"company": "廠商"})
+            st.dataframe(agg[["廠商", "案數", "總金額（萬）", "自家"]], use_container_width=True, hide_index=True)
+
+            st.markdown("**明細**（時間｜廠商｜機關｜金額）")
+            st.dataframe(_detail(sub), use_container_width=True,
+                         column_config={"url": st.column_config.LinkColumn("連結"),
+                                        "金額": st.column_config.NumberColumn(format="%d")})
+        else:
+            st.info("選一個機關後顯示")
+
+    else:  # 廠商 → 看服務機關
+        kw = st.text_input("廠商名（部分即可，case-insensitive）", placeholder="例：凌網、關貿、精誠")
+        if kw:
+            sub = ex[ex["company"].str.contains(kw, case=False, na=False)]
+            if len(sub) == 0:
+                st.warning(f"查無含「{kw}」的得標廠商")
+            else:
+                hits = sorted(sub["company"].unique().tolist())
+                if len(hits) > 1:
+                    st.caption(f"⚠️ 命中 {len(hits)} 家：{'｜'.join(hits[:8])}{' …' if len(hits) > 8 else ''}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("服務機關數", f"{sub['unit_name'].nunique():,}")
+                c2.metric("決標案數", f"{len(sub):,}")
+                c3.metric("決標總額（億）", f"{sub['award_amount'].sum() / 1e8:.2f}")
+
+                st.markdown(f"**「{kw}」服務過的機關**")
+                agg = sub.groupby("unit_name").agg(
+                    案數=("job_number", "count"),
+                    總金額=("award_amount", "sum"),
+                ).sort_values("總金額", ascending=False).reset_index()
+                agg["總金額（萬）"] = (agg["總金額"].fillna(0) / 1e4).round(0).astype(int)
+                agg = agg.rename(columns={"unit_name": "機關"})
+                st.dataframe(agg[["機關", "案數", "總金額（萬）"]], use_container_width=True, hide_index=True)
+
+                st.markdown("**明細**（時間｜廠商｜機關｜金額）")
+                st.dataframe(_detail(sub), use_container_width=True,
+                             column_config={"url": st.column_config.LinkColumn("連結"),
+                                            "金額": st.column_config.NumberColumn(format="%d")})
+        else:
+            st.info("輸入廠商名後顯示")
 
 # ---------- 得標機會雷達 ----------
 elif selected == "得標機會雷達":

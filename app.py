@@ -68,13 +68,14 @@ st.markdown(
       /* 頁首 band（保留深藍品牌條，字放大）*/
       .gbw-header {{
         background: linear-gradient(90deg, {NAVY} 0%, {NAVY2} 100%);
-        color: #fff; border-radius: 14px; padding: 20px 28px; margin-bottom: 16px;
+        color: #fff; border-radius: 14px; padding: 26px 30px; margin-bottom: 16px;
         display: flex; justify-content: space-between; align-items: center;
+        gap: 16px; flex-wrap: wrap;
       }}
       .gbw-header * {{ color: #fff; }}
-      .gbw-header .title {{ font-size: 2rem; font-weight: 800; letter-spacing: 1px; }}
-      .gbw-header .subtitle {{ font-size: 1.05rem; opacity: 0.9; margin-top: 3px; }}
-      .gbw-header .meta {{ text-align: right; font-size: 1rem; opacity: 0.92; line-height: 1.6; }}
+      .gbw-header .title {{ font-size: 1.7rem; font-weight: 800; letter-spacing: 1px; line-height: 1.35; }}
+      .gbw-header .subtitle {{ font-size: 1rem; opacity: 0.9; margin-top: 4px; line-height: 1.4; }}
+      .gbw-header .meta {{ text-align: right; font-size: 1rem; opacity: 0.92; line-height: 1.7; white-space: nowrap; }}
       /* 區塊標題放大 */
       .gbw-section {{ font-size: 1.3rem; font-weight: 700; color: {NAVY};
         border-left: 5px solid {ACCENT}; padding-left: 12px; margin: 6px 0 10px; }}

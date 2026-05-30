@@ -39,36 +39,47 @@ NAVY2 = "#13315C"
 ACCENT = "#2E86DE"
 GREEN = "#27AE60"
 
-# ---------- 樣式 ----------
+# ---------- 樣式（淡色系 + 放大字體）----------
 st.markdown(
     f"""
     <style>
+      /* 全站字體放大 ~18% */
+      html, body, [class*="css"], .stMarkdown, p, li, label,
+      div[data-testid="stMetricLabel"], .stDataFrame {{ font-size: 18px; }}
       .block-container {{ padding-top: 1rem; padding-bottom: 2rem; max-width: 100%; }}
-      /* KPI / metric 卡片化 */
+      /* 淺色底 */
+      .stApp {{ background: #F4F6F9; }}
+      /* KPI / metric 卡片 */
       div[data-testid="stMetric"] {{
         background: #FFFFFF;
-        border: 1px solid #E6E9EF;
-        border-left: 4px solid {ACCENT};
-        border-radius: 10px;
-        padding: 14px 16px;
-        box-shadow: 0 1px 4px rgba(11,37,69,0.06);
+        border: 1px solid #E3E8EF;
+        border-left: 5px solid {ACCENT};
+        border-radius: 12px;
+        padding: 16px 18px;
+        box-shadow: 0 1px 6px rgba(20,49,92,0.07);
       }}
-      div[data-testid="stMetricLabel"] p {{ font-size: 0.82rem; color: #5A6473; }}
-      div[data-testid="stMetricValue"] {{ font-size: 1.55rem; color: {NAVY}; font-weight: 700; }}
-      /* 側邊深色 */
-      section[data-testid="stSidebar"] {{ background: {NAVY}; }}
-      section[data-testid="stSidebar"] * {{ color: #E8EDF4; }}
-      /* 頁首 band */
+      div[data-testid="stMetricLabel"] p {{ font-size: 1rem; color: #5A6473; }}
+      div[data-testid="stMetricValue"] {{ font-size: 2rem; color: {NAVY}; font-weight: 700; }}
+      div[data-testid="stMetricDelta"] {{ font-size: 1rem; }}
+      /* 側欄改淺色 */
+      section[data-testid="stSidebar"] {{ background: #FFFFFF; border-right: 1px solid #E3E8EF; }}
+      section[data-testid="stSidebar"] * {{ color: {NAVY}; }}
+      section[data-testid="stSidebar"] h3 {{ font-size: 1.25rem; }}
+      /* 頁首 band（保留深藍品牌條，字放大）*/
       .gbw-header {{
         background: linear-gradient(90deg, {NAVY} 0%, {NAVY2} 100%);
-        color: #fff; border-radius: 12px; padding: 18px 26px; margin-bottom: 14px;
+        color: #fff; border-radius: 14px; padding: 20px 28px; margin-bottom: 16px;
         display: flex; justify-content: space-between; align-items: center;
       }}
-      .gbw-header .title {{ font-size: 1.6rem; font-weight: 800; letter-spacing: 1px; }}
-      .gbw-header .subtitle {{ font-size: 0.9rem; opacity: 0.85; margin-top: 2px; }}
-      .gbw-header .meta {{ text-align: right; font-size: 0.85rem; opacity: 0.9; line-height: 1.5; }}
-      .gbw-section {{ font-size: 1.05rem; font-weight: 700; color: {NAVY};
-        border-left: 4px solid {ACCENT}; padding-left: 10px; margin: 4px 0 8px; }}
+      .gbw-header * {{ color: #fff; }}
+      .gbw-header .title {{ font-size: 2rem; font-weight: 800; letter-spacing: 1px; }}
+      .gbw-header .subtitle {{ font-size: 1.05rem; opacity: 0.9; margin-top: 3px; }}
+      .gbw-header .meta {{ text-align: right; font-size: 1rem; opacity: 0.92; line-height: 1.6; }}
+      /* 區塊標題放大 */
+      .gbw-section {{ font-size: 1.3rem; font-weight: 700; color: {NAVY};
+        border-left: 5px solid {ACCENT}; padding-left: 12px; margin: 6px 0 10px; }}
+      h1, h2, h3 {{ color: {NAVY}; }}
+      .stTabs [data-baseweb="tab"] {{ font-size: 1.05rem; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -152,10 +163,10 @@ try:
             menu_title=None, options=NAV_ITEMS, icons=NAV_ICONS,
             default_index=0,
             styles={
-                "container": {"background-color": NAVY, "padding": "0"},
-                "icon": {"color": "#8FB7E8", "font-size": "16px"},
-                "nav-link": {"color": "#E8EDF4", "font-size": "14px",
-                             "--hover-color": NAVY2},
+                "container": {"background-color": "#FFFFFF", "padding": "0"},
+                "icon": {"color": ACCENT, "font-size": "18px"},
+                "nav-link": {"color": NAVY, "font-size": "16px",
+                             "--hover-color": "#EAF1FB"},
                 "nav-link-selected": {"background-color": ACCENT, "color": "#fff"},
             },
         )
@@ -164,7 +175,7 @@ except ImportError:
 
 st.sidebar.divider()
 st.sidebar.caption(
-    "資料源：g0v 標案瀏覽器 API\n\n"
+    "資料源：政府電子採購網（pcc-tender via TwinkleAI）\n\n"
     f"自家識別：{'、'.join(OWN_COMPANIES[:3])}…"
 )
 

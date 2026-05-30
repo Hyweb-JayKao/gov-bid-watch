@@ -1,0 +1,9 @@
+# 強制淡色主題（不跟隨瀏覽器/雲端的 dark 設定）
+[theme]
+base = "light"
+primaryColor = "#2E86DE"
+backgroundColor = "#F4F6F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1A2433"
+# 基準字體放大（搭配 app.py CSS 的 html font-size）
+baseFontSize = 18

@@ -32,7 +32,10 @@ from fetch_bids import BLACKLIST, KEYWORDS, pre_filter  # noqa: E402
 
 ENDPOINT = "https://api.twinkleai.tw/mcp/"
 DATASET = "pcc-tender"
-PAGE = 500  # query_rows 單頁列數
+# ⚠️ query_rows 的 offset 帶 WHERE 時會被忽略（實測 offset 0/500/1000 回傳相同），
+#    且單次最多回 ~5000 列 → 不能用 offset 分頁。改按「月」切窗，每月軟體類
+#    約 70-300 筆（遠低於上限），一次撈全、跨月用 seen set 去重。
+MONTH_LIMIT = 5000
 
 # pcc 只給粗分類；軟體類保留勞務類 + 財物類（工程類整批排除）
 KEEP_ATTR = ("勞務類", "財物類")
@@ -169,24 +172,39 @@ def map_row(rec):
     }
 
 
+def _month_windows(since, until):
+    """[(start,end), ...] 逐月（含跨年），yyyy-mm-01 ~ 該月底。"""
+    s = datetime.strptime(since, "%Y-%m-%d").replace(day=1)
+    u = datetime.strptime(until, "%Y-%m-%d")
+    wins = []
+    cur = s
+    while cur <= u:
+        nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)  # 下月 1 號
+        end = min(nxt - timedelta(days=1), u)
+        wins.append((cur.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
+        cur = nxt
+    return wins
+
+
 def fetch(since, until, token):
     mcp = MCP(token)
-    where = (f"date >= '{since}' AND date <= '{until}' "
-             f"AND procurement_attr IN ('勞務類','財物類') "
-             f"AND ({_kw_clause()})")
-    rows, offset, seen = [], 0, set()
+    kw = _kw_clause()
+    rows, seen = [], set()
     dropped_bl = 0
-    while True:
-        d = mcp.query_rows(where, COLS, PAGE, offset)
+    wins = _month_windows(since, until)
+    for i, (ws, we) in enumerate(wins, 1):
+        where = (f"date >= '{ws}' AND date <= '{we}' "
+                 f"AND procurement_attr IN ('勞務類','財物類') AND ({kw})")
+        d = mcp.query_rows(where, COLS, MONTH_LIMIT)
         cols = d.get("columns", [])
         batch = d.get("rows", [])
-        if not batch:
-            break
+        if len(batch) >= MONTH_LIMIT:
+            print(f"⚠️ {ws} 回傳達上限 {MONTH_LIMIT}，可能截斷（需再細切）", file=sys.stderr)
+        added = 0
         for r in batch:
             rec = dict(zip(cols, r))
             title = rec.get("title") or ""
-            # 細篩：python 端套黑名單（DB 只做了正向關鍵字）
-            if not pre_filter(title):
+            if not pre_filter(title):  # 細篩：python 端套黑名單
                 dropped_bl += 1
                 continue
             key = (rec.get("agency_id") or rec.get("agency"), rec.get("job_number"), rec.get("date"))
@@ -194,12 +212,10 @@ def fetch(since, until, token):
                 continue
             seen.add(key)
             rows.append(map_row(rec))
-        print(f"[offset {offset}] +{len(batch)} (kept {len(rows)}, blacklist drop {dropped_bl})",
+            added += 1
+        print(f"[{i}/{len(wins)} {ws}] raw {len(batch)} +{added} (total {len(rows)}, bl drop {dropped_bl})",
               file=sys.stderr)
-        if len(batch) < PAGE:
-            break
-        offset += PAGE
-        time.sleep(0.3)
+        time.sleep(0.2)
     return rows
 
 

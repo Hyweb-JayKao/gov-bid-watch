@@ -68,7 +68,7 @@ st.markdown(
       /* 頁首 band（保留深藍品牌條，字放大）*/
       .gbw-header {{
         background: linear-gradient(90deg, {NAVY} 0%, {NAVY2} 100%);
-        color: #fff; border-radius: 14px; padding: 26px 30px; margin-bottom: 16px;
+        color: #fff; border-radius: 14px; padding: 48px 30px 32px; margin-bottom: 16px;
         display: flex; justify-content: space-between; align-items: center;
         gap: 16px; flex-wrap: wrap;
       }}

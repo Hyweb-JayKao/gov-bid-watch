@@ -12,8 +12,8 @@ name: Weekly fetch (pcc-tender via TwinkleAI)
 # （啟用 Actions 後，本機 launchd 二擇一，避免兩邊都寫 bids.csv 撞 commit）
 
 on:
-  # schedule:
-  #   - cron: "0 0 * * 1"  # 每週一 08:00 台北（手動驗證成功後再啟用）
+  schedule:
+    - cron: "0 0 * * 1"  # 每週一 08:00 台北（手動 dispatch 驗證成功後啟用）
   workflow_dispatch:
     inputs:
       days:

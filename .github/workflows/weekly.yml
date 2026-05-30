@@ -1,20 +1,24 @@
-name: Weekly fetch (DISABLED — 改由本機 launchd 跑)
+name: Weekly fetch (pcc-tender via TwinkleAI)
 
-# 停用原因: GitHub Actions IP 段被 g0v API (pcc-api.openfun.app) 擋 403
-# 改用本機 launchd: ~/Library/LaunchAgents/com.jaykao.gov-bid-watch.plist
-# 每週一 08:00 本機執行 ~/scripts/gov-bid-watch-weekly.sh
+# 資料源已從 g0v 換成 TwinkleAI pcc-tender（scripts/fetch_pcc.py）。
+# g0v 會擋 GitHub Actions IP（403）→ 當初停用改本機 launchd；
+# pcc-tender 走 TwinkleAI endpoint（api.twinkleai.tw，非 g0v Cloudflare）→ Actions 可跑。
+#
+# ⚠️ 啟用前置：到 repo Settings → Secrets and variables → Actions
+#    新增 secret  TWINKLE_API_KEY = sk-xxxx
+#
+# schedule 預設「註解停用」：先用 workflow_dispatch 手動跑一次確認 Actions IP
+# 沒被 TwinkleAI 擋、且 merge/commit 正常，再取消下面 schedule 的註解啟用自動排程。
+# （啟用 Actions 後，本機 launchd 二擇一，避免兩邊都寫 bids.csv 撞 commit）
 
 on:
   # schedule:
-  #   - cron: "0 0 * * 1"  # 停用：API 擋 GitHub Actions IP
+  #   - cron: "0 0 * * 1"  # 每週一 08:00 台北（手動驗證成功後再啟用）
   workflow_dispatch:
     inputs:
       days:
-        description: "抓取天數（預設 7）"
-        default: "7"
-      detail:
-        description: "是否抓 tender detail（true/false）"
-        default: "true"
+        description: "抓取天數（預設 14；pcc 為半月公開資料，14 天確保重疊）"
+        default: "14"
 
 jobs:
   fetch:
@@ -31,15 +35,16 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Fetch bids
+      - name: Fetch bids (pcc-tender)
+        env:
+          TWINKLE_API_KEY: ${{ secrets.TWINKLE_API_KEY }}
         run: |
-          DAYS="${{ github.event.inputs.days || '7' }}"
-          DETAIL="${{ github.event.inputs.detail || 'true' }}"
-          if [ "$DETAIL" = "false" ]; then
-            python scripts/fetch_bids.py --days "$DAYS" --no-detail --out data/weekly.csv
-          else
-            python scripts/fetch_bids.py --days "$DAYS" --out data/weekly.csv
+          if [ -z "$TWINKLE_API_KEY" ]; then
+            echo "::error::缺 secret TWINKLE_API_KEY（Settings → Secrets → Actions）"
+            exit 1
           fi
+          DAYS="${{ github.event.inputs.days || '14' }}"
+          python scripts/fetch_pcc.py --days "$DAYS" --out data/weekly.csv
 
       - name: Merge to master
         run: python scripts/merge.py --weekly data/weekly.csv --master data/bids.csv
@@ -49,5 +54,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/bids.csv
-          git diff --cached --quiet || git commit -m "data: weekly update $(date -u +%Y-%m-%d)"
+          git diff --cached --quiet || git commit -m "data: weekly update $(date -u +%Y-%m-%d) (pcc-tender)"
           git push

@@ -711,10 +711,11 @@ elif selected == "關聯查詢":
     ex["company"] = ex["company"].str.strip()
     ex = ex[ex["company"] != ""]
 
-    DETAIL_COLS = {"date": "時間", "company": "廠商", "unit_name": "機關", "award_amount": "金額"}
+    DETAIL_COLS = {"date": "時間", "title": "標案名稱", "company": "廠商",
+                   "unit_name": "機關", "award_amount": "金額"}
 
     def _detail(sub):
-        d = sub[["date", "company", "unit_name", "award_amount", "url"]].sort_values("date", ascending=False)
+        d = sub[["date", "title", "company", "unit_name", "award_amount", "url"]].sort_values("date", ascending=False)
         return d.rename(columns=DETAIL_COLS)
 
     mode = st.radio("視角", ["機關 → 看服務廠商", "廠商 → 看服務機關"], horizontal=True)

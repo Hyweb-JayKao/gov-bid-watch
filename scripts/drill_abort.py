@@ -33,12 +33,13 @@ def _p0_rows(n):
     return [{
         "unit_id": f"U{i}", "job_number": f"J{i}", "date": "20260613",
         "title": "圖書館資訊系統建置案", "unit_name": "國立臺灣圖書館",
-        "type": "公開招標", "url": "http://example/x",
+        "type": "公開招標", "url": "http://example/x", "category": "勞務類",
     } for i in range(n)]
 
 
 def _write_csv(path, rows):
-    cols = ["unit_id", "job_number", "date", "title", "unit_name", "type", "url"]
+    cols = ["unit_id", "job_number", "date", "title", "unit_name", "type", "url",
+            "category"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()

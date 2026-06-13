@@ -12,7 +12,8 @@ from slack_notify import build_payload, notify  # noqa: E402
 
 
 def _write_csv(path, rows):
-    cols = ["unit_id", "job_number", "date", "title", "unit_name", "type", "url"]
+    cols = ["unit_id", "job_number", "date", "title", "unit_name", "type", "url",
+            "category"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -20,9 +21,11 @@ def _write_csv(path, rows):
             w.writerow({c: r.get(c, "") for c in cols})
 
 
-def _p0_row(i, agency="國立臺灣圖書館", title="圖書館資訊系統建置"):
+def _p0_row(i, agency="國立臺灣圖書館", title="圖書館資訊系統建置", category="勞務類"):
+    # category 預設勞務類：issue #14 收緊後 P0 須為勞務類採購（軟體開發服務）
     return {"unit_id": f"U{i}", "job_number": f"J{i}", "date": "20260613",
-            "title": title, "unit_name": agency, "type": "公開招標", "url": "http://x"}
+            "title": title, "unit_name": agency, "type": "公開招標", "url": "http://x",
+            "category": category}
 
 
 # ---------- Slack ----------

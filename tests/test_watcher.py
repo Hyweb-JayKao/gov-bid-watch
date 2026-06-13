@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import watcher  # noqa: E402
+import watcher_diff  # noqa: E402
 from slack_notify import build_payload, notify  # noqa: E402
 
 
@@ -86,6 +87,51 @@ def test_cost_cap_triggers_alert_no_push(tmp_path, monkeypatch):
     assert Path(res["alert"]).exists()
     payload = json.loads(Path(res["alert"]).read_text(encoding="utf-8"))
     assert payload["kind"] == "push_cap_exceeded" and payload["p0_count"] == 25
+
+
+def test_cost_cap_alert_includes_blocked_list(tmp_path, monkeypatch):
+    """0 漏報鐵則：capped 時水位前進，alert 必須含被擋 P0 完整清單供人工補救。"""
+    csvp = tmp_path / "w.csv"
+    statep = tmp_path / "s.json"
+    monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    rows = [_p0_row(i, title=f"圖書館資訊系統建置-{i}") for i in range(25)]
+    _write_csv(csvp, rows)
+    res = watcher.run(str(csvp), str(statep), dry_run=True, push_cap=20)
+    payload = json.loads(Path(res["alert"]).read_text(encoding="utf-8"))
+    blocked = payload["blocked_p0"]
+    # 全部 25 筆被擋的 P0 都要在清單裡，且帶可辨識欄位
+    assert len(blocked) == 25
+    sample = blocked[0]
+    assert {"title", "unit_name", "job_number"} <= set(sample)
+    # 內容不是空殼：title/job_number 對得回原始列
+    titles = {b["title"] for b in blocked}
+    assert titles == {f"圖書館資訊系統建置-{i}" for i in range(25)}
+    jobs = {b["job_number"] for b in blocked}
+    assert jobs == {f"J{i}" for i in range(25)}
+
+
+# ---------- watcher_diff 空 key 去重 ----------
+def test_empty_key_rows_not_deduped(tmp_path):
+    """三主鍵全空的不同標案不可被去重成一筆（否則漏報；issue #14 §4）。"""
+    rows = [
+        {"unit_id": "", "agency_id": "", "job_number": "", "date": "",
+         "title": "甲案：系統建置", "unit_name": "A 機關"},
+        {"unit_id": "", "agency_id": "", "job_number": "", "date": "",
+         "title": "乙案：系統建置", "unit_name": "B 機關"},
+    ]
+    # 兩筆內容不同 → key 必須不同
+    assert watcher_diff.row_key(rows[0]) != watcher_diff.row_key(rows[1])
+    # find_new 不去重，兩筆都算新出現
+    new = watcher_diff.find_new(rows, {"seen_keys": []})
+    assert len(new) == 2
+
+
+def test_empty_key_same_content_still_deduped(tmp_path):
+    """主鍵全空但內容完全相同 → 仍視為同一筆去重（fallback 用 title+unit_name）。"""
+    r = {"unit_id": "", "job_number": "", "date": "",
+         "title": "同案", "unit_name": "同機關"}
+    new = watcher_diff.find_new([dict(r), dict(r)], {"seen_keys": []})
+    assert len(new) == 1
 
 
 def test_runlog_written(tmp_path):

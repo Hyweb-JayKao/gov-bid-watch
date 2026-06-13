@@ -40,11 +40,13 @@ key 沿用 merge 主鍵 `(unit_id, job_number, date)`。
 
 ### D4. 成本封頂 = loop 終止/降級錨點
 
-單輪 P0 候選 > 20 → **不推、寫 alert**（`data/alerts/`）+ 水位仍前進避免下輪重複爆量；
-單輪 > 5 分鐘 → alert（硬 kill 靠 CI step timeout）。
+單輪 P0 候選 > 20 → **不推、寫 alert**（`data/alerts/`，alert 含被擋 P0 完整清單供人工補救）+ 水位仍前進避免下輪重複爆量；
+時間封頂 → **由 CI step `timeout-minutes: 5` 硬 kill**，watcher.py 不做軟檢查。
 
 - 為何：loop 最大風險是「規則錯/資料異常 → 轟爆 Slack」。封頂讓 loop 在失控時**停下喊人**而非繼續輸出。這是 pilot 要驗的兩個工程真空之一。
-- 反方：>20 真的有 20 個 P0 時會被誤擋。取捨：pilot 階段「停下喊人」優於「誤轟」；閾值可調（`--push-cap`）。
+- 時間封頂為何移到 CI：watcher 內 diff/P0 是純記憶體操作，跑不到 300s，真正慢的 fetch 在 watcher 之外（另一 step），檔內軟檢查永遠觸發不到 = 擺設。硬 kill 交給 CI `timeout-minutes` 才真正生效。
+- 0 漏報修正：capped 後水位前進，被擋 P0 下輪不再被 `find_new` 看到 → alert 必須記完整被擋清單（title/unit_name/job_number），否則靜默漏報。
+- 反方：>20 真的有 20 個 P0 時會被誤擋。取捨：pilot 階段「停下喊人」優於「誤轟」；閾值可調（`--push-cap`），且被擋清單已留存可補救。
 - 中止演練（`drill_abort.py`）= 回退水位人造爆量，驗證封頂確實觸發，可重複執行。
 
 ### D5. Slack 停在 dry-run（checkpoint，issue #14 §7）

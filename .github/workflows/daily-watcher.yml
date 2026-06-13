@@ -27,7 +27,7 @@ on:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10        # 硬時間封頂：超時 CI 自動 kill（呼應 watcher TIME_CAP）
+    timeout-minutes: 10        # job 級硬時間封頂；watcher step 另設 5 分鐘細粒度封頂
     permissions:
       contents: write
     steps:
@@ -54,13 +54,17 @@ jobs:
         run: python scripts/merge.py --weekly data/weekly.csv --master data/bids.csv
 
       - name: P0 watcher (diff → P0 → 封頂 → Slack)
+        # 時間封頂在此 step 硬 kill（取代 watcher.py 已移除的軟檢查；ADR D4）。
+        # diff/P0 純記憶體操作極快，5 分鐘足夠；超時即 fail 喊人。
+        timeout-minutes: 5
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           PUSH="${{ github.event.inputs.push || 'false' }}"
           ARGS="--weekly data/weekly.csv --state data/watcher_state.json"
           if [ "$PUSH" = "true" ]; then ARGS="$ARGS --push"; fi
-          # watcher capped/timeout 回 exit 2 → 標記但不讓整個 job 失敗（降級是正常路徑）
+          # watcher capped 回 exit 2 → 標記但不讓整個 job 失敗（降級是正常路徑；
+          # 時間封頂改靠本 step timeout-minutes 硬 kill，不再經 exit 2）
           python scripts/watcher.py $ARGS || ec=$?
           if [ "${ec:-0}" = "2" ]; then
             echo "::warning::watcher 觸發成本封頂/超時降級（見 data/alerts/）"

@@ -15,6 +15,7 @@ state schema:
   "runs": [ {ts, fetched, new, pushed, watermark} ... ]  # run-log（保留近 N 筆）
 }
 """
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -24,10 +25,19 @@ RUNLOG_KEEP = 60  # 保留近 60 輪 run-log（每日跑 → 約 2 個月）
 
 
 def row_key(row: dict) -> str:
-    """sched 主鍵，對齊 merge.py PRIMARY_KEYS (unit_id, job_number, date)。"""
+    """sched 主鍵，對齊 merge.py PRIMARY_KEYS (unit_id, job_number, date)。
+
+    主鍵三欄若全空（"||"），多筆不同標案會被 find_new 的 seen_this_batch
+    去重成同一筆 → 漏報（issue #14 §4 0 漏報）。三欄全空時 fallback：
+    用 title + unit_name 的 hash 當 key，至少讓內容不同的列各自成 key。
+    """
     uid = row.get("unit_id") or row.get("agency_id") or ""
     job = row.get("job_number") or ""
     date = row.get("date") or ""
+    if not (uid or job or date):
+        seed = f"{row.get('title', '')}|{row.get('unit_name', '')}"
+        h = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+        return f"fallback|{h}"
     return f"{uid}|{job}|{date}"
 
 

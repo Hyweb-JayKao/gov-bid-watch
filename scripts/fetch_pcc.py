@@ -237,15 +237,24 @@ def fetch(since, until, token):
     return rows
 
 
+# 輸出 csv 固定欄位（= map_row 的 key 順序）。0 筆時也用它寫 header-only，
+# 避免下游 merge/watcher 找不到檔——daily 高頻場景當天常 0 筆新案（2026-06-13 踩過：
+# pcc 半月公開資料近期窗常 0 筆，no-rows 不寫檔 → merge step 失敗）
+OUT_FIELDS = [
+    "date", "unit_name", "unit_id", "type", "title", "category", "budget",
+    "award_amount", "awarded_at", "companies", "job_number", "url",
+    "notice_date", "award_way", "county", "county_code", "town_code",
+    "contact_person", "contact_phone", "losing_supplier",
+]
+
+
 def write_csv(rows, path):
-    if not rows:
-        print("no rows", file=sys.stderr)
-        return
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
         w.writeheader()
         w.writerows(rows)
-    print(f"wrote {len(rows)} rows -> {path}", file=sys.stderr)
+    tag = " (header-only, 0 筆)" if not rows else ""
+    print(f"wrote {len(rows)} rows -> {path}{tag}", file=sys.stderr)
 
 
 def main():

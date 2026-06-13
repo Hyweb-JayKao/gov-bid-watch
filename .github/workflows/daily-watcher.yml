@@ -1,0 +1,82 @@
+name: Daily P0 watcher (pcc-tender → Slack)
+
+# loop engineering pilot（issue #14）：每日 fetch → merge → P0 watcher → Slack 推播。
+#
+# ⚠️ 啟用前置（人類動作，pilot 期留 Jay）：
+#   1. repo Settings → Secrets → Actions 新增：
+#        TWINKLE_API_KEY = sk-xxxx
+#        SLACK_WEBHOOK_URL = https://hooks.slack.com/...   ← Jay 設，確認 payload 格式後才填
+#   2. 確認 dry-run dispatch 跑通、payload 格式 OK 後，
+#      才把 watcher step 的 --push 打開 + 取消 schedule 註解。
+#
+# schedule 預設「註解停用」：先 workflow_dispatch 手動驗。
+# Slack 預設 dry-run（不傳 --push）→ 只印 payload 不推真頻道，符合 #14 checkpoint。
+
+on:
+  # schedule:
+  #   - cron: "0 0 * * *"   # 每日 08:00 台北（dispatch 驗證 + Jay 設 webhook 後啟用）
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "抓取天數（預設 2；每日跑只需近 2 天確保重疊）"
+        default: "2"
+      push:
+        description: "實際推 Slack？（true=推，預設 false=dry-run）"
+        default: "false"
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10        # job 級硬時間封頂；watcher step 另設 5 分鐘細粒度封頂
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Fetch (pcc-tender)
+        env:
+          TWINKLE_API_KEY: ${{ secrets.TWINKLE_API_KEY }}
+        run: |
+          if [ -z "$TWINKLE_API_KEY" ]; then
+            echo "::error::缺 secret TWINKLE_API_KEY"; exit 1
+          fi
+          DAYS="${{ github.event.inputs.days || '2' }}"
+          python scripts/fetch_pcc.py --days "$DAYS" --out data/weekly.csv
+
+      - name: Merge to master
+        run: python scripts/merge.py --weekly data/weekly.csv --master data/bids.csv
+
+      - name: P0 watcher (diff → P0 → 封頂 → Slack)
+        # 時間封頂在此 step 硬 kill（取代 watcher.py 已移除的軟檢查；ADR D4）。
+        # diff/P0 純記憶體操作極快，5 分鐘足夠；超時即 fail 喊人。
+        timeout-minutes: 5
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          PUSH="${{ github.event.inputs.push || 'false' }}"
+          ARGS="--weekly data/weekly.csv --state data/watcher_state.json"
+          if [ "$PUSH" = "true" ]; then ARGS="$ARGS --push"; fi
+          # watcher capped 回 exit 2 → 標記但不讓整個 job 失敗（降級是正常路徑；
+          # 時間封頂改靠本 step timeout-minutes 硬 kill，不再經 exit 2）
+          python scripts/watcher.py $ARGS || ec=$?
+          if [ "${ec:-0}" = "2" ]; then
+            echo "::warning::watcher 觸發成本封頂/超時降級（見 data/alerts/）"
+          elif [ "${ec:-0}" != "0" ]; then
+            exit "$ec"
+          fi
+
+      - name: Commit state + master + alerts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/bids.csv data/watcher_state.json data/alerts 2>/dev/null || true
+          git diff --cached --quiet || \
+            git commit -m "watcher: daily run $(date -u +%Y-%m-%dT%H:%M) (state+runlog)"
+          git push

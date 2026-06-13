@@ -13,8 +13,8 @@ name: Daily P0 watcher (pcc-tender → Slack)
 # Slack 預設 dry-run（不傳 --push）→ 只印 payload 不推真頻道，符合 #14 checkpoint。
 
 on:
-  # schedule:
-  #   - cron: "0 0 * * *"   # 每日 08:00 台北（dispatch 驗證 + Jay 設 webhook 後啟用）
+  schedule:
+    - cron: "0 0 * * *"   # 每日 08:00 台北（2026-06-13 啟用：webhook 已設 + P0 收緊勞務類）
   workflow_dispatch:
     inputs:
       days:
@@ -60,7 +60,8 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          PUSH="${{ github.event.inputs.push || 'false' }}"
+          # schedule 觸發（每日自動）→ 真推；手動 dispatch → 看 input（預設 dry-run）
+          PUSH="${{ github.event.inputs.push || (github.event_name == 'schedule' && 'true' || 'false') }}"
           ARGS="--weekly data/weekly.csv --state data/watcher_state.json"
           if [ "$PUSH" = "true" ]; then ARGS="$ARGS --push"; fi
           # watcher capped 回 exit 2 → 標記但不讓整個 job 失敗（降級是正常路徑；

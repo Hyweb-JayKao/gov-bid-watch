@@ -81,6 +81,17 @@ class MCP:
     def _post(self, payload):
         r = self.s.post(ENDPOINT, headers=self.h, json=payload, timeout=120)
         r.encoding = "utf-8"
+        # MCP streamable HTTP（2025 transport）：initialize 的 response header 帶
+        # Mcp-Session-Id，後續所有請求必須回帶，否則 server 回 400 Missing session ID。
+        # （2026-06-13 TwinkleAI transport 升級踩過）
+        sid = r.headers.get("Mcp-Session-Id") or r.headers.get("mcp-session-id")
+        if sid:
+            self.h["Mcp-Session-Id"] = sid
+        # 不吞 HTTP 錯誤：非 200 直接 raise 帶 body 摘要（避免下游收到籠統的
+        # "no valid response" 而盲猜根因——2026-06-13 token/工具名 debug 教訓）
+        # 200 = 有 body 的回應；202 = notification 被接受（無 body，正常）
+        if r.status_code not in (200, 202):
+            raise RuntimeError(f"HTTP {r.status_code} from {ENDPOINT}: {r.text[:300]}")
         out = []
         for line in r.text.splitlines():
             if line.startswith("data:"):
@@ -94,9 +105,13 @@ class MCP:
         rid = self._next()
         args = {"dataset_id": DATASET, "where": where, "columns": columns,
                 "limit": limit, "offset": offset, "order_by": "date DESC"}
+        last_res = None
         for i in range(retries):
+            # 工具名 = query_rows（TwinkleAI 2026 改版已去掉 opendata- prefix；
+            # 用舊名 server 回 unknown tool → 解析不到 → 籠統失敗，2026-06-13 踩過）
             res = self._post({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
-                              "params": {"name": "opendata-query_rows", "arguments": args}})
+                              "params": {"name": "query_rows", "arguments": args}})
+            last_res = res
             for m in res:
                 if m.get("id") == rid:
                     txt = "".join(x.get("text", "") for x in m.get("result", {}).get("content", [])
@@ -106,7 +121,10 @@ class MCP:
                         raise RuntimeError(f"query_rows error: {d['error']}")
                     return d
             time.sleep(1 + i * 2)
-        raise RuntimeError("query_rows: no valid response after retries")
+        # raise 時帶最後一批訊息線索（不再盲猜：是工具名錯/SSE 格式變/限流）
+        raise RuntimeError(
+            f"query_rows: no valid response after {retries} retries; "
+            f"last batch={len(last_res or [])} msgs, sample={str(last_res)[:300]}")
 
 
 def _kw_clause():

@@ -73,11 +73,44 @@ jobs:
             exit "$ec"
           fi
 
-      - name: Commit state + master + alerts
+      # 任一前置 step 失敗 → 寫失敗告警 alert（消滅靜默失敗）。
+      # 退出碼 0 不再連鎖失敗；alert markdown 隨下方 commit step 進 repo（留痕）。
+      # 心跳：notify_failure 讀 watcher_state.last_run，連續 ≥3 天無成功 → 升級 high。
+      - name: 失敗告警（寫 alert）
+        if: failure()
         run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python scripts/notify_failure.py \
+            --reason "daily watcher run 失敗（fetch/merge/watcher 任一 step）" \
+            --run-url "$RUN_URL" \
+            --state data/watcher_state.json \
+            --out-dir data/alerts
+
+      # always()：即便前面失敗也要把 state / alert 提交留痕（含失敗告警 md）。
+      # ⚠️ push 失敗「不可隱形」（codex high）：若有東西 commit 了卻 push 不上去，
+      # 告警/state watermark 沒進 repo → 下輪拿舊 state 重算、失敗證據遺失。
+      # 故 push 失敗時讓本 job 紅燈，不再 `|| true` 吞掉。
+      # 容錯：先 rebase 重試（吸收併發 non-fast-forward），仍失敗才 fail。
+      - name: Commit state + master + alerts
+        if: always()
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/bids.csv data/watcher_state.json data/alerts 2>/dev/null || true
-          git diff --cached --quiet || \
-            git commit -m "watcher: daily run $(date -u +%Y-%m-%dT%H:%M) (state+runlog)"
-          git push
+          if git diff --cached --quiet; then
+            echo "沒有需要提交的變更，略過 push。"
+            exit 0
+          fi
+          git commit -m "watcher: daily run $(date -u +%Y-%m-%dT%H:%M) (state/runlog/alert)"
+          # push 重試：non-fast-forward 時 rebase 後再推，最多 3 次；全失敗 → 紅燈喊人。
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "push 成功（第 $attempt 次嘗試）。"
+              exit 0
+            fi
+            echo "::warning::push 第 $attempt 次失敗，rebase 後重試…"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          done
+          echo "::error::state/alert push 連續 3 次失敗——告警與 watcher_state 未進 repo，本 job 判定失敗（不靜默）。"
+          exit 1

@@ -73,11 +73,26 @@ jobs:
             exit "$ec"
           fi
 
+      # 任一前置 step 失敗 → 寫失敗告警 alert（消滅靜默失敗）。
+      # 退出碼 0 不再連鎖失敗；alert markdown 隨下方 commit step 進 repo（留痕）。
+      # 心跳：notify_failure 讀 watcher_state.last_run，連續 ≥3 天無成功 → 升級 high。
+      - name: 失敗告警（寫 alert）
+        if: failure()
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python scripts/notify_failure.py \
+            --reason "daily watcher run 失敗（fetch/merge/watcher 任一 step）" \
+            --run-url "$RUN_URL" \
+            --state data/watcher_state.json \
+            --out-dir data/alerts
+
+      # always()：即便前面失敗也要把 state / alert 提交留痕（含失敗告警 md）。
       - name: Commit state + master + alerts
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/bids.csv data/watcher_state.json data/alerts 2>/dev/null || true
           git diff --cached --quiet || \
-            git commit -m "watcher: daily run $(date -u +%Y-%m-%dT%H:%M) (state+runlog)"
-          git push
+            git commit -m "watcher: daily run $(date -u +%Y-%m-%dT%H:%M) (state/runlog/alert)"
+          git push || true

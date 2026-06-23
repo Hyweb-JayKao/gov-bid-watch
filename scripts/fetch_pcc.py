@@ -26,9 +26,40 @@ import time
 from datetime import datetime, timedelta
 
 import requests
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 # 軟體開發類過濾規則沿用 g0v fetcher（單一事實源，不重複維護）
 from fetch_bids import BLACKLIST, KEYWORDS, pre_filter  # noqa: E402
+
+
+# ---------- 暫時性錯誤 → 觸發 retry（永久性錯誤不重試，免燒配額）----------
+class TransientHTTPError(RuntimeError):
+    """閘道層間歇錯誤（裸 nginx 401 / 5xx / timeout）→ 值得 retry。
+
+    與 app 層 JSON-RPC error 區分：後者是邏輯錯（工具名/SQL/配額耗盡），
+    retry 無用，由 query_rows 另行 raise RuntimeError 不進這條。
+    """
+
+
+# 401 = TwinkleAI 閘道間歇抖動（回裸 nginx 頁、非 JSON-RPC 認證錯，run 歷史呈
+#       ✅❌✅❌ 間歇 → 非 key 死掉）；5xx = 上游暫時不可用；皆暫時性值得 retry。
+RETRY_STATUS = frozenset({401, 429, 500, 502, 503, 504})
+
+# retry 上限 5 次嘗試（首發 + 4 retry），指數 backoff 1→2→4→8s（封頂 10s），
+# 設上限避免閘道持續 401 時無限重試燒配額/CI 時間（job timeout 10 分鐘內收斂）。
+_RETRY_KW = dict(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(
+        (TransientHTTPError, requests.Timeout, requests.ConnectionError)
+    ),
+    reraise=True,
+)
 
 ENDPOINT = "https://api.twinkleai.tw/mcp/"
 DATASET = "pcc-tender"
@@ -78,8 +109,15 @@ class MCP:
         self._id += 1
         return self._id
 
+    @retry(**_RETRY_KW)
     def _post(self, payload):
-        r = self.s.post(ENDPOINT, headers=self.h, json=payload, timeout=120)
+        # @retry：閘道層間歇 401/5xx/timeout 自動指數 backoff 重試（見 _RETRY_KW）。
+        # 每次重試重新發 POST，session header（含 Mcp-Session-Id）沿用。
+        try:
+            r = self.s.post(ENDPOINT, headers=self.h, json=payload, timeout=120)
+        except (requests.Timeout, requests.ConnectionError):
+            # 連線層暫時性失敗 → 原樣往上拋，由 @retry 攔截重試
+            raise
         r.encoding = "utf-8"
         # MCP streamable HTTP（2025 transport）：initialize 的 response header 帶
         # Mcp-Session-Id，後續所有請求必須回帶，否則 server 回 400 Missing session ID。
@@ -91,7 +129,12 @@ class MCP:
         # "no valid response" 而盲猜根因——2026-06-13 token/工具名 debug 教訓）
         # 200 = 有 body 的回應；202 = notification 被接受（無 body，正常）
         if r.status_code not in (200, 202):
-            raise RuntimeError(f"HTTP {r.status_code} from {ENDPOINT}: {r.text[:300]}")
+            msg = f"HTTP {r.status_code} from {ENDPOINT}: {r.text[:300]}"
+            # 暫時性狀態（裸 nginx 401 閘道抖動 / 5xx / 429）→ 觸發 retry；
+            # 其餘（如 400 session 錯、403 永久拒）→ 永久性錯，不重試直接 raise。
+            if r.status_code in RETRY_STATUS:
+                raise TransientHTTPError(msg)
+            raise RuntimeError(msg)
         out = []
         for line in r.text.splitlines():
             if line.startswith("data:"):

@@ -1,0 +1,134 @@
+#!/bin/bash
+# pre-commit-gate — Claude Code PreToolUse:Bash hook
+#
+# 在 git commit 真正執行前把三道閘，任一不過就 block 並印出原因：
+#   1. 有 commit message（git commit 帶 -m / -F / -t，禁開編輯器空 commit）
+#   2. staged diff ≤ PRECOMMIT_MAX_DIFF 行（預設 150，可由環境變數覆寫）
+#   3. 測試綠燈（跑 PRECOMMIT_TEST_CMD；未設定 = skip-with-warning，不擋）
+#
+# 設計來源：Cerebras Sarah Chieng Tip 7（收緊 commit 權限建護欄）。
+# 取代 settings.json 裡被移除的 `Bash(git commit:*)` allow —— 改由本 hook 把關。
+#
+# 慣例（對齊 FLUX charter-tier0-guard.sh）：
+#   - 從 stdin 讀 tool-call JSON，只處理 git commit 的 Bash 呼叫
+#   - block：印 {"decision":"block","reason":...} 後 exit 0
+#   - 放行：印 {} 後 exit 0
+#   - hook 內部錯誤不應阻塞（不要 set -e）；非 git commit 一律放行
+#
+# 本機自測（不經 Claude Code）：
+#   echo '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}' | .claude/hooks/pre-commit-gate
+
+# 在 fork 出的任何路徑都能跑：優先用 Claude Code 注入的專案根
+: "${CLAUDE_PROJECT_DIR:=$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+: "${PRECOMMIT_MAX_DIFF:=150}"
+# 失敗軌跡落地目錄（建 SkillOpt corpus；issue #8）。可由環境變數覆寫。
+: "${PRECOMMIT_TRAJECTORY_DIR:=$CLAUDE_PROJECT_DIR/.claude/trajectories}"
+
+allow()  { echo "{}"; exit 0; }
+# 用 python 安全 JSON-encode reason（中文 / 換行 / 引號 / log 裡的壞 byte 都不破 JSON）
+block()  {
+  REASON="$1" python3 -c "import json,os; r=os.environb[b'REASON'].decode('utf-8','replace'); print(json.dumps({'decision':'block','reason':r}))"
+  exit 0
+}
+
+# capture_trajectory — 把一條「測試失敗軌跡」append 進 trajectories/ 的 JSONL（issue #8）。
+# 只在閘3（測試沒過）呼叫；閘1/閘2 是 commit 衛生不是訓練訊號，不捕。
+# 鐵則：
+#   - 必在 block() 之前呼叫（block 內含 exit）。
+#   - error-tolerant：本函式任何失敗都不得影響 commit 的 block/allow 判定
+#     （故全部包進 subshell + `|| true`，且只寫 stderr，不碰 stdout 的 JSON 決策）。
+#   - 序列化走 python3 json.dumps：diff 含任意 byte / 引號 / 換行都不破 JSON。
+# 參數：$1=測試指令  $2=完整 fail log 路徑
+capture_trajectory() {
+  (
+    TEST_CMD="$1"
+    LOG_PATH="$2"
+    mkdir -p "$PRECOMMIT_TRAJECTORY_DIR" 2>/dev/null || exit 0
+    OUT="$PRECOMMIT_TRAJECTORY_DIR/failures.jsonl"
+    # skill/prompt 版本指紋：repo 子樹的 HEAD commit（沒 git 就標 unknown）
+    SKILL_FP=$(cd "$CLAUDE_PROJECT_DIR" 2>/dev/null \
+      && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    # context proxy：hook 唯一拿得到的脈絡——branch + 本次想 commit 的命令全文
+    BRANCH=$(cd "$CLAUDE_PROJECT_DIR" 2>/dev/null \
+      && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    STAGED_DIFF=$(cd "$CLAUDE_PROJECT_DIR" 2>/dev/null && git diff --cached 2>/dev/null)
+    FAIL_LOG=$(cat "$LOG_PATH" 2>/dev/null)
+    TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    OUT="$OUT" TS="$TS" SCHEMA="1" GATE="test-green" BRANCH="$BRANCH" COMMIT_CMD="$CMD" \
+    TEST_CMD="$TEST_CMD" SKILL_FP="$SKILL_FP" \
+    STAGED_DIFF="$STAGED_DIFF" FAIL_LOG="$FAIL_LOG" \
+    python3 -c '
+import json, os
+g = lambda k: os.environb.get(k.encode(), b"").decode("utf-8", "replace")
+rec = {
+    "schema": int(g("SCHEMA") or "1"),
+    "ts": g("TS"),
+    "gate": g("GATE"),
+    "branch": g("BRANCH"),
+    "commit_cmd": g("COMMIT_CMD"),
+    "test_cmd": g("TEST_CMD"),
+    "skill_fingerprint": g("SKILL_FP"),
+    "staged_diff": g("STAGED_DIFF"),
+    "fail_log": g("FAIL_LOG"),
+    # future correlation 欄位（本期不填；修正成功的 diff 在 fail 當下拿不到）：
+    "fix_diff": None,
+    "outcome": "fail",
+}
+with open(os.environ["OUT"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+' 2>/dev/null
+  ) || true
+}
+
+# --- 讀 tool-call JSON ---
+INPUT=$(cat)
+TOOL_NAME=$(printf '%s' "$INPUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tool_name',''))" 2>/dev/null || echo "")
+[ "$TOOL_NAME" = "Bash" ] || allow
+
+CMD=$(printf '%s' "$INPUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tool_input',{}).get('command',''))" 2>/dev/null || echo "")
+
+# 只攔「實際執行 git commit」的命令位置（避免 heredoc / git log --grep 'commit' 等誤判）
+FIRST_LINE=$(printf '%s' "$CMD" | head -n 1)
+echo "$FIRST_LINE" | grep -qE "(^|[;&|]| )git( -[A-Za-z=./_-]+ | )commit\b" || allow
+
+# === 閘 1：有 commit message ===
+# 視為「帶 message」的情形（任一命中即放行閘1）：
+#   - 長旗標：--message / --file / --template / --reuse-message / --reedit-message / --amend / --squash / --fixup
+#   - 短旗標（可成簇）：-m / -F / -t / -C / -c，含 -am / -sm 這種組合（簇內含 m/F/t/C 即算）
+# 都沒有 = 會開互動編輯器（agent/hook 情境＝空 commit 風險）→ 擋。
+HAS_MSG=0
+echo "$CMD" | grep -qE "(^|[[:space:]])--(message|file|template|reuse-message|reedit-message|amend|squash|fixup)([[:space:]=]|$)" && HAS_MSG=1
+# 短旗標簇：一個 dash 後接 a-zA-Z 簇且含 m/F/t/C/c（排除 -- 長旗標：用 [^-] 確保第一字元非 dash）
+echo "$CMD" | grep -qE "(^|[[:space:]])-[A-Za-z]*[mFtCc]" && HAS_MSG=1
+if [ "$HAS_MSG" -eq 0 ]; then
+  block "🔴 pre-commit-gate 閘1：git commit 沒帶 commit message（-m/-F/-t）。請用 git commit -m \"...\"，不要開互動編輯器空 commit。"
+fi
+
+# === 閘 2：staged diff 行數 ≤ 門檻 ===
+# 用 staged（--cached）的 numstat 加總 added+deleted；binary 檔 numstat 回 '-' 跳過不計。
+DIFF_LINES=$(cd "$CLAUDE_PROJECT_DIR" 2>/dev/null && git diff --cached --numstat 2>/dev/null \
+  | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {s+=$1+$2} END {print s+0}')
+DIFF_LINES=${DIFF_LINES:-0}
+if [ "$DIFF_LINES" -gt "$PRECOMMIT_MAX_DIFF" ]; then
+  block "🔴 pre-commit-gate 閘2：staged diff $DIFF_LINES 行 > 上限 $PRECOMMIT_MAX_DIFF 行。小步 PR 原則：拆成更小的 commit，或 export PRECOMMIT_MAX_DIFF=N 顯式放寬（請在 PR body 說明為何放寬）。"
+fi
+
+# === 閘 3：測試綠燈 ===
+# PRECOMMIT_TEST_CMD 未設 = 範本 / 還沒配測試 = skip-with-warning（不擋，否則種子 repo 無法 commit）。
+if [ -z "${PRECOMMIT_TEST_CMD:-}" ]; then
+  # warning 走 stderr，不影響 JSON 放行判定
+  echo "[pre-commit-gate] ⚠️ 閘3 跳過：未設 PRECOMMIT_TEST_CMD。fork 後請在 VERIFY.md 的『測試』指令設成此環境變數，commit 前才會真的跑測試。" >&2
+else
+  if ! ( cd "$CLAUDE_PROJECT_DIR" && eval "$PRECOMMIT_TEST_CMD" ) >/tmp/precommit-gate-test.log 2>&1; then
+    # 失敗軌跡持久化落地（issue #8）：必在 block 之前、且不得影響 block 判定。
+    # /tmp log 下次會被覆寫，這裡把它連同 staged diff / 指紋結構化存進 trajectories/。
+    capture_trajectory "$PRECOMMIT_TEST_CMD" "/tmp/precommit-gate-test.log"
+    TAIL=$(tail -n 15 /tmp/precommit-gate-test.log 2>/dev/null)
+    block "🔴 pre-commit-gate 閘3：測試未通過（指令：$PRECOMMIT_TEST_CMD）。修綠燈再 commit。
+（已存失敗軌跡到 .claude/trajectories/failures.jsonl）
+末尾輸出：
+$TAIL"
+  fi
+fi
+
+allow

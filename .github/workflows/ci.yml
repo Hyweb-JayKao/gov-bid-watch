@@ -8,11 +8,17 @@ name: CI (pytest on PR)
 #
 # 只跑測試，不碰資料、不 push、不 deploy（純驗證，無不可逆動作）。
 
+# codex#3（第 2 輪）流程對齊：Ship-PR-Until-Green loop 的順序是「feature branch
+# 改 code → push feature → 等該 commit 的 CI 綠 → 才開 PR」。若 CI 只在 PR→main /
+# push→main 觸發，feature branch 還沒 PR 時就沒有 CI 信號，runner 會卡在
+# 「找不到本輪 SHA 的 run」→ STOP(3)。故 push 觸發放寬到所有分支：feature branch
+# 一 push 就跑 CI，runner 等的客觀信號實際會產生；PR→main 仍各自跑（含外部 fork PR）。
 on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches:
+      - "**"
 
 permissions:
   contents: read

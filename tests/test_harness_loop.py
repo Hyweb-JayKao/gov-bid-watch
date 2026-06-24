@@ -141,10 +141,26 @@ def _cur_branch():
     ).stdout.strip()
 
 
+def _run_on_branch(branch, env_extra, **kw):
+    """模擬「當前分支＝branch」跑 runner（驗受保護分支判定），不真的切 branch。
+
+    不能在 worktree 切到 main（main 被另一 worktree 佔用，checkout 會失敗並污染後續
+    測試）。改注入 git stub：攔 `rev-parse --abbrev-ref HEAD` 回假 branch 名，其餘
+    git 子命令 delegate 真 git。guard 只看 cur_branch 的輸出，這樣即可精準驗分支判定。
+    """
+    git_stub = (
+        'args="$*"\n'
+        'case "$args" in\n'
+        f'  *"rev-parse --abbrev-ref HEAD"*) echo "{branch}"; exit 0 ;;\n'
+        'esac\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    return _run(env_extra, stub_git=git_stub, **kw)
+
+
 def test_protected_branch_hard_block():
-    # PROTECTED_RE 命中當前分支 → 第一層硬擋(2)
-    cur = _cur_branch()
-    rc, err = _run({"PROTECTED_RE": f"^{cur}$"}, iter0=0)
+    # 在內建受保護分支 main 上 → 第一層內建硬擋(2)，不靠任何 env。
+    rc, err = _run_on_branch("main", {}, iter0=0)
     assert rc == 2, f"受保護分支應拒絕 exit 2，得 {rc}: {err}"
     assert "受保護分支" in err
 
@@ -156,14 +172,27 @@ def test_non_feature_branch_blocked_by_whitelist():
     assert "白名單" in err or "feature" in err
 
 
-def test_protected_block_not_bypassable_by_widening_whitelist():
-    # 即使把白名單放寬到 .*（想放行任何分支），PROTECTED_RE 第一層仍硬擋。
-    cur = _cur_branch()
-    rc, err = _run(
-        {"PROTECTED_RE": f"^{cur}$", "ALLOWED_FEATURE_RE": ".*"},
-        iter0=0,
-    )
-    assert rc == 2, f"放寬白名單不該繞過 PROTECTED_RE 硬擋，得 {rc}: {err}"
+def test_protected_block_not_bypassable_by_env_clearing_and_widening():
+    # ★ codex#3 第 2 輪假綠根因：上輪可用 PROTECTED_RE='^$' ALLOWED_FEATURE_RE='.*'
+    #   同時清空硬擋 + 放寬白名單，讓 main 兩層全繞過。
+    #   現在受保護判定錨在內建常數（env 動不了），這組 env 在 main/master 仍須拒絕(2)。
+    for b in ("main", "master"):
+        rc, err = _run_on_branch(
+            b,
+            {"PROTECTED_RE": "^$", "ALLOWED_FEATURE_RE": ".*",
+             "PROTECTED_EXTRA_RE": "^$"},
+            iter0=0,
+        )
+        assert rc == 2, (
+            f"env 清空+放寬不該繞過內建保護（branch={b}），得 {rc}: {err}")
+        assert "受保護分支" in err
+
+
+def test_protected_extra_re_can_only_tighten():
+    # env 只能「收緊」：PROTECTED_EXTRA_RE 可把額外分支（如 staging/x）也列為受保護。
+    rc, err = _run_on_branch(
+        "staging/x", {"PROTECTED_EXTRA_RE": "^staging/.*$"}, iter0=0)
+    assert rc == 2, f"PROTECTED_EXTRA_RE 追加保護應拒絕 exit 2，得 {rc}: {err}"
     assert "受保護分支" in err
 
 

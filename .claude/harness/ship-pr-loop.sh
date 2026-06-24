@@ -30,16 +30,28 @@ set -euo pipefail
 : "${MAX_WALL:=3600}"         # 保險絲：牆鐘秒數上限（60 分）
 : "${TEST_CMD:=python3 -m pytest -q}"  # 客觀本機信號（對齊 VERIFY.md；本機用 python3，CI 用 python）
 
-# 受保護分支守門＝白名單制（codex#3）：只有「feature 分支」可被 loop 動作（push）。
-# feature 分支＝符合 ALLOWED_FEATURE_RE 的分支名（預設 feat/ fix/ chore/ docs/ test/ refactor/ 開頭）。
-# 任何其他分支（main/master/release*/prod*/develop…）一律拒絕。
-# 安全鐵則：此白名單【不可】由普通 env 放寬到涵蓋受保護分支——下方 guard 會把
-# 「未命中白名單」一律當受保護，不存在「把 main 加進白名單」這條路。
+# ──────────────────────────────────────────────────────────────────────────
+# 受保護分支守門（codex#3 第 2 輪：env 不可放寬/清空，只能收緊）
+# ──────────────────────────────────────────────────────────────────────────
+# spec §2.3 不可逆邊界硬要求：受保護分支守門「env 無法關掉」。
+#
+# 上一輪用 `: "${PROTECTED_RE:=...}"` / `: "${ALLOWED_FEATURE_RE:=...}"` 仍可被
+# 普通 env 完全覆寫：`PROTECTED_RE='^$' ALLOWED_FEATURE_RE='.*'` 就同時清空硬擋 +
+# 放寬白名單，讓 main 兩層都繞過（= 假修）。
+#
+# 第 2 輪改法：
+#   (1) 受保護判定錨在【程式內建常數】PROTECTED_BUILTIN_RE，完全不吃 env，env 動不了它。
+#   (2) env 只開「收緊」一個方向：PROTECTED_EXTRA_RE 可【追加】更多受保護分支，
+#       不存在「移除/清空內建保護」的 env 路徑。
+#   (3) feature 白名單同理：實際放行條件＝命中白名單 AND 不命中內建保護；
+#       ALLOWED_FEATURE_RE 可由 env 收窄；即使被放成 '.*'，內建保護仍先硬擋，
+#       不存在「把 main 加進白名單」這條路。
+# 內建受保護分支常數——【不可由 env 覆寫或清空】。
+readonly PROTECTED_BUILTIN_RE='^(main|master|develop|release([/-].*)?|prod([/-].*)?|production([/-].*)?|hotfix([/-].*)?)$'
+# env 只能【追加】更多受保護分支（收緊），預設不追加。設了也只會「多擋」，不會少擋。
+: "${PROTECTED_EXTRA_RE:=}"
+# feature 白名單：env 可收窄（少放行），放寬無效——下方 guard 內建保護永遠先擋。
 : "${ALLOWED_FEATURE_RE:=^(feat|fix|chore|docs|test|refactor|perf|ci|build|style)/.+}"
-# 永遠拒絕清單（即使有人亂改 ALLOWED_FEATURE_RE 想放行，這層仍硬擋）。
-# 可 env 覆寫以涵蓋更多受保護分支或供測試；注意覆寫只能【放寬擋誰】，
-# 放寬本清單不會放行非 feature 分支——白名單第二層仍獨立把關。
-: "${PROTECTED_RE:=^(main|master|develop|release([/-].*)?|prod([/-].*)?|production([/-].*)?|hotfix([/-].*)?)$}"
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 STATE_DIR="$ROOT/.claude/harness/.state"
@@ -87,17 +99,24 @@ json.dump(d, open(path,"w"), ensure_ascii=False, indent=2)
 PY
 }
 
-# ---------- 不可逆邊界守門（白名單制，任何時候被叫到都先擋）----------
-# codex#3：黑名單可被 env 繞過。改白名單——只有命中 ALLOWED_FEATURE_RE 的 feature
-# 分支放行；同時 PROTECTED_RE 永遠硬擋（即使有人放寬白名單也擋得住）。
+# ---------- 不可逆邊界守門（任何時候被叫到都先擋）----------
+# codex#3（第 2 輪）：受保護判定錨在內建常數 PROTECTED_BUILTIN_RE，env 動不了它；
+# env 只能用 PROTECTED_EXTRA_RE 追加更多保護（收緊）。三層：
+#   第一層：內建受保護清單硬擋（env 無法清空/放寬）。
+#   第一層+：env 追加的額外受保護分支（只多擋不少擋）。
+#   第二層：feature 白名單——非 feature 分支一律拒絕（env 放寬白名單也越不過第一層）。
 guard_irreversible() {
   local b; b="$(cur_branch)"
   [ -n "$b" ] || die "無法取得當前分支名，拒絕 loop 動作。"
-  # 第一層：永遠拒絕清單（防有人改白名單想放行受保護分支）
-  if printf '%s' "$b" | grep -Eq "$PROTECTED_RE"; then
-    die "在受保護分支 '${b}' 上，禁止 loop 動作（PROTECTED_RE 硬擋）。請在隔離 worktree 的 feature 分支跑。"
+  # 第一層：內建受保護清單（程式常數，env 無法覆寫/清空）。
+  if printf '%s' "$b" | grep -Eq "$PROTECTED_BUILTIN_RE"; then
+    die "在受保護分支 '${b}' 上，禁止 loop 動作（內建保護硬擋，env 無法繞過）。請在隔離 worktree 的 feature 分支跑。"
   fi
-  # 第二層：白名單——非 feature 分支一律拒絕
+  # 第一層+：env 追加的額外受保護分支（只能收緊；空字串＝不追加）。
+  if [ -n "$PROTECTED_EXTRA_RE" ] && printf '%s' "$b" | grep -Eq "$PROTECTED_EXTRA_RE"; then
+    die "在受保護分支 '${b}' 上，禁止 loop 動作（PROTECTED_EXTRA_RE 追加保護）。"
+  fi
+  # 第二層：白名單——非 feature 分支一律拒絕（放寬白名單越不過第一層內建保護）。
   if ! printf '%s' "$b" | grep -Eq "$ALLOWED_FEATURE_RE"; then
     die "分支 '${b}' 非 feature 分支（未命中白名單 ${ALLOWED_FEATURE_RE}），禁止 loop 動作。"
   fi

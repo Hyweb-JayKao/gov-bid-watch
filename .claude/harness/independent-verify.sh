@@ -47,7 +47,10 @@ fi
 # ── (b) 撈遠端 CI 結論（非 LLM 錨信號）──
 # codex#6：原本只看 LOCAL_PASS、忽略 CI_STATE。
 #   獨立驗收的達標鐵則（spec §3.3）＝【本機綠 AND 遠端 required CI success】。
-#   CI_PASS 三態：1=全綠且至少一個 check；0=有 fail；2=未知(無 PR / gh 不可用 / pending / 無 check)。
+# codex#4（第 2 輪）：原本「全部 pass/skipping」一律當 PASS → 全 skipping/neutral
+#   （什麼都沒真跑）也被當綠＝假綠。改：必須【至少一個 check 真的 pass】、且【無 fail、無 pending】
+#   才算 success；全 skipped/neutral/空 → UNKNOWN(2)，不可 PASS。
+#   CI_PASS 三態：1=至少一個真 pass 且無 fail/pending；0=有 fail；2=未知(無 PR/gh 不可用/pending/全 skip/空)。
 CI_PASS=2
 CI_STATE="skipped(無 PR 號或 gh 不可用)"
 if [ -n "$PR" ] && command -v gh >/dev/null 2>&1; then
@@ -61,17 +64,25 @@ if [ -n "$PR" ] && command -v gh >/dev/null 2>&1; then
     CI_PASS=0
   elif printf '%s\n' "$CHECKS" | grep -qiE '^(pending|in_progress|queued|waiting)'; then
     CI_PASS=2; CI_STATE="${CI_STATE} (尚有 pending，未定論)"
-  else
-    # 全部 pass/skipping 且至少有一個 check
+  elif printf '%s\n' "$CHECKS" | grep -qiE '^(pass|success)'; then
+    # 至少一個 check 真的 pass，且（經上面排除）無 fail、無 pending → 真 success。
     CI_PASS=1
+  else
+    # 走到這＝有 check 但沒有任何一個真 pass（全 skipping/neutral/skipped）→ 什麼都沒真驗。
+    CI_PASS=2; CI_STATE="${CI_STATE} (全 skipping/neutral，無任何真 pass → 不可當綠)"
   fi
   say "   CI checks: ${CI_STATE}"
 fi
 
+case "$CI_PASS" in
+  1) CI_LABEL=PASS ;;
+  0) CI_LABEL=FAIL ;;
+  *) CI_LABEL=UNKNOWN ;;
+esac
 say ""
 say "── 機械驗收結果 ──"
 say "本機測試全綠     : $([ "$LOCAL_PASS" = 1 ] && echo PASS || echo FAIL)"
-say "遠端 CI          : $(case $CI_PASS in 1) echo PASS;; 0) echo FAIL;; *) echo UNKNOWN;; esac) (${CI_STATE})"
+say "遠端 CI          : ${CI_LABEL} (${CI_STATE})"
 say ""
 say "下一步（qa-automation-architect 在【本 session】續做，非開發 session）："
 say "  1. 讀 spec 的 AC，逐條確認有對應測試且涵蓋（填 AC 對照表）"

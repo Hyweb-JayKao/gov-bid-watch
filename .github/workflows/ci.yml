@@ -1,0 +1,34 @@
+name: CI (pytest on PR)
+
+# harness P1 前提件（spec ship-pr-until-green-harness §5 前提1）：
+# Ship-PR-Until-Green loop 需要一個「pull_request → main 跑全測試」的客觀達標信號。
+# 此 workflow 即該信號來源：每個對 main 的 PR / push 都跑 pytest，conclusion=success
+# 才算 loop「達標停」。在此之前 gov-bid-watch 只有 schedule/dispatch 的資料抓取
+# workflow（daily-watcher / weekly），沒有 PR 測試 CI。
+#
+# 只跑測試，不碰資料、不 push、不 deploy（純驗證，無不可逆動作）。
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Run pytest
+        run: python -m pytest -q

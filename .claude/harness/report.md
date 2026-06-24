@@ -67,6 +67,18 @@ runner 自測（子行程餵狀態檔），exit code 契約全符：
 
 **不在本輪**：pre-commit-gate（codex#4/#5，既有 sw-factory hook 問題）已另開 sw-factory#106，本 PR 不動。
 
+## 四點六、codex 第 2 輪複審退回修（2026-06-24）
+
+第 1 輪 7 問 → 第 2 輪剩 3 點（codex 確認上輪 #1/#2/#5 真修好）。本輪修以下 3 點，皆有回歸測試釘住：
+
+| # | 漏洞（為何上輪是假綠） | 修法 | 怎麼證明真修好 |
+|---|------|------|---------|
+| #3（核心）| 上輪 `PROTECTED_RE`/`ALLOWED_FEATURE_RE` 用 `:=` 預設賦值，仍可被普通 env **完全覆寫**。`PROTECTED_RE='^$' ALLOWED_FEATURE_RE='.*'` 即同時清空硬擋 + 放寬白名單 → main 兩層全繞。上輪測試只測「放寬白名單但 PROTECTED_RE 仍命中」，沒測「兩層同時放寬」＝刻意避開根因。 | 受保護判定錨在程式**內建常數** `readonly PROTECTED_BUILTIN_RE`（env 完全動不了）；env 只開 `PROTECTED_EXTRA_RE` 一個**收緊**方向（追加更多受保護分支，無清空/放寬路徑）。白名單放寬越不過第一層內建保護。 | `test_protected_block_not_bypassable_by_env_clearing_and_widening`：對 main+master 同時下 `PROTECTED_RE='^$' ALLOWED_FEATURE_RE='.*' PROTECTED_EXTRA_RE='^$'`，**仍須 exit 2 拒絕**——這條正是上輪假綠根因，現在釘死。另 `test_protected_extra_re_can_only_tighten` 驗 env 只能加擋（staging/x 被 EXTRA 列保護→拒絕）。 |
+| #4 | `independent-verify.sh` 把「全 skipping/neutral」（什麼都沒真跑）也判 PASS。 | 改：必須**至少一個 check 真 pass** 且無 fail/pending 才 success；全 skip/neutral/空 → UNKNOWN(2)，不可放行。順手修 line 74 `case` 嵌在 `$(...)` 內的 bash syntax error（拆成獨立 `case` 算 `CI_LABEL`，原 bug 會讓判定漏接而誤 exit 0）。 | 新增 `tests/test_independent_verify.py` 10 案：`test_all_skipping_is_not_pass`、`test_all_neutral_is_not_pass`、`test_no_check_is_not_pass` 全須 exit 2；`test_real_pass_passes`（真 pass→0）、`test_pass_plus_skipping_still_passes`（真 pass+skip→0）守住不過度收緊。 |
+| 流程不一致 | `ci.yml` 只在 `PR→main`/`push→main` 觸發，但流程是「loop 綠才開 PR」→ feature branch 還沒 PR 時無 CI 信號 → runner `wait_remote_ci` 找不到本輪 SHA 的 run → STOP(3) 卡死。 | `push` 觸發放寬到所有分支（`branches: ["**"]`）：feature branch 一 push 就跑 CI，runner 等的客觀 CI 信號實際會產生；`PR→main` 仍各自跑（含 fork PR）。 | push 後 GitHub Actions 對 feature commit 觸發 CI（PR #20 push 即驗）；runner `wait_remote_ci` 綁本輪 HEAD SHA 能撈到對應 run。 |
+
+**本輪驗證結果**：harness 兩檔測試 `test_harness_loop.py`(14) + `test_independent_verify.py`(10) 全綠；全 repo `116 passed, 5 xfailed`。本機綠，已 push 同 branch 觸發遠端 CI。
+
 ## 五、未完成 / 待人接手
 
 1. ④ 探索測試 + AC 逐條對照：須換乾淨 session 派 qa-automation-architect（建者不自驗）。本 report 只完成機械半。

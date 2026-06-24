@@ -22,14 +22,24 @@
 #
 # 狀態檔（跨輪累積，落 .claude/harness/.state/）：iter / 紅項分數歷史 / 起始時間 / token（由 agent 回填）。
 
-set -uo pipefail
+set -euo pipefail
 
 # ---------- 設定（可由環境變數覆寫，預設＝spec §8 拍板值）----------
-: "${MAX_ITER:=8}"            # 保險絲：迭代輪數硬上限
+: "${MAX_ITER:=8}"            # 保險絲：迭代輪數硬上限（語意：最多跑 MAX_ITER 輪，第 MAX_ITER 輪後停）
 : "${NO_PROGRESS_N:=3}"       # 無進展停：連續 N 輪紅項分數沒降
 : "${MAX_WALL:=3600}"         # 保險絲：牆鐘秒數上限（60 分）
 : "${TEST_CMD:=python3 -m pytest -q}"  # 客觀本機信號（對齊 VERIFY.md；本機用 python3，CI 用 python）
-: "${BRANCH_PREFIX_MAIN:=main}"        # 受保護分支名（禁直接 push）
+
+# 受保護分支守門＝白名單制（codex#3）：只有「feature 分支」可被 loop 動作（push）。
+# feature 分支＝符合 ALLOWED_FEATURE_RE 的分支名（預設 feat/ fix/ chore/ docs/ test/ refactor/ 開頭）。
+# 任何其他分支（main/master/release*/prod*/develop…）一律拒絕。
+# 安全鐵則：此白名單【不可】由普通 env 放寬到涵蓋受保護分支——下方 guard 會把
+# 「未命中白名單」一律當受保護，不存在「把 main 加進白名單」這條路。
+: "${ALLOWED_FEATURE_RE:=^(feat|fix|chore|docs|test|refactor|perf|ci|build|style)/.+}"
+# 永遠拒絕清單（即使有人亂改 ALLOWED_FEATURE_RE 想放行，這層仍硬擋）。
+# 可 env 覆寫以涵蓋更多受保護分支或供測試；注意覆寫只能【放寬擋誰】，
+# 放寬本清單不會放行非 feature 分支——白名單第二層仍獨立把關。
+: "${PROTECTED_RE:=^(main|master|develop|release([/-].*)?|prod([/-].*)?|production([/-].*)?|hotfix([/-].*)?)$}"
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 STATE_DIR="$ROOT/.claude/harness/.state"
@@ -77,37 +87,83 @@ json.dump(d, open(path,"w"), ensure_ascii=False, indent=2)
 PY
 }
 
-# ---------- 不可逆邊界守門（任何時候被叫到都先擋）----------
+# ---------- 不可逆邊界守門（白名單制，任何時候被叫到都先擋）----------
+# codex#3：黑名單可被 env 繞過。改白名單——只有命中 ALLOWED_FEATURE_RE 的 feature
+# 分支放行；同時 PROTECTED_RE 永遠硬擋（即使有人放寬白名單也擋得住）。
 guard_irreversible() {
   local b; b="$(cur_branch)"
-  [ "$b" = "$BRANCH_PREFIX_MAIN" ] && die "在受保護分支 '${b}' 上，禁止 loop 動作。請在隔離 worktree 的 feature 分支跑。"
-  # worktree dirty 檢查交給 agent 的小步 commit，這裡只擋分支
+  [ -n "$b" ] || die "無法取得當前分支名，拒絕 loop 動作。"
+  # 第一層：永遠拒絕清單（防有人改白名單想放行受保護分支）
+  if printf '%s' "$b" | grep -Eq "$PROTECTED_RE"; then
+    die "在受保護分支 '${b}' 上，禁止 loop 動作（PROTECTED_RE 硬擋）。請在隔離 worktree 的 feature 分支跑。"
+  fi
+  # 第二層：白名單——非 feature 分支一律拒絕
+  if ! printf '%s' "$b" | grep -Eq "$ALLOWED_FEATURE_RE"; then
+    die "分支 '${b}' 非 feature 分支（未命中白名單 ${ALLOWED_FEATURE_RE}），禁止 loop 動作。"
+  fi
   return 0
+}
+
+# 驗 TEST_CMD 白名單（在主流程前置呼叫，非 command substitution 內，避免 die 被 subshell 吞）。
+# 不用 eval（防注入）：只允許 python / python3 / pytest 開頭。其他拒絕 → die(exit 2)。
+assert_test_cmd_safe() {
+  local first
+  read -ra _TEST_ARGV <<<"$TEST_CMD"
+  first="${_TEST_ARGV[0]:-}"
+  case "$first" in
+    python|python3|pytest) return 0 ;;
+    *) die "TEST_CMD 首字 '${first}' 不在白名單(python/python3/pytest)，拒絕執行。" ;;
+  esac
+}
+
+# 執行 TEST_CMD（陣列分詞，不經 eval）。前提：已先跑 assert_test_cmd_safe。
+run_test_cmd() {
+  read -ra _TEST_ARGV <<<"$TEST_CMD"
+  ( cd "$ROOT" && "${_TEST_ARGV[@]}" )
 }
 
 # 客觀分數：未通過的測試「信號」數。pytest 失敗→取 failed 數；全綠→0。
 # 回 0 = 達標候選；>0 = 還有紅項。
 run_local_signal() {
-  local log="$STATE_DIR/last-test.log"
-  if ( cd "$ROOT" && eval "$TEST_CMD" ) >"$log" 2>&1; then
+  local log="$STATE_DIR/last-test.log" n
+  if run_test_cmd >"$log" 2>&1; then
     echo 0; return 0
   fi
   # 從 pytest 尾巴抓 "N failed"；抓不到就記 1（有紅但數不清）
-  local n
-  n="$(grep -oE '[0-9]+ failed' "$log" | grep -oE '[0-9]+' | tail -1)"
+  n="$(grep -oE '[0-9]+ failed' "$log" | grep -oE '[0-9]+' | tail -1 || true)"
   echo "${n:-1}"
 }
 
-# 等遠端 CI：對當前 branch 的最新 commit 等 GitHub Actions 結論。
-# 回 0=success / 1=failure / 2=未知(無 CI run / gh 不可用)
+# 等遠端 CI：對【本輪 push 的 commit SHA】等 GitHub Actions 結論。
+# codex#2：原本抓 branch 最新 run，可能是上一輪舊 commit 的 run → 拿舊綠當本輪成功。
+#   改為：只認 headSha == 本輪 HEAD 的 run；找不到對應本輪 SHA 的 run 視為「未知」。
+# 參數：$1 = 期望的 commit SHA（本輪 push 的 HEAD）。
+# 回 0=success / 1=failure / 2=未知(gh 不可用 / 無對應本輪 SHA 的 run / 逾時)
 wait_remote_ci() {
-  local b; b="$(cur_branch)"
-  command -v gh >/dev/null 2>&1 || { say "⚠️ 無 gh CLI，跳過遠端 CI 等待（只憑本機信號）"; return 2; }
-  say "⏳ 等遠端 CI（branch=${b}）…"
-  # gh run watch 對最新一次該 branch 的 run；先抓 run id
-  local rid
-  rid="$(gh run list --branch "$b" --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null)"
-  [ -n "$rid" ] || { say "⚠️ 該 branch 尚無 CI run（可能 CI 未啟用或 push 未觸發）"; return 2; }
+  local b expect rid head_sha tries
+  b="$(cur_branch)"
+  expect="${1:-}"
+  command -v gh >/dev/null 2>&1 || { say "⚠️ 無 gh CLI，無法取得遠端 CI 達標信號"; return 2; }
+  [ -n "$expect" ] || { say "⚠️ 未提供本輪 commit SHA，無法綁定 CI run"; return 2; }
+  say "⏳ 等遠端 CI（branch=${b}，commit=${expect:0:8}）…"
+  # 輪詢等「該 branch 上 headSha==本輪 SHA」的 run 出現。
+  # 次數/間隔可 env 覆寫（CI_POLL_TRIES/CI_POLL_SLEEP，預設 ~10 分鐘；測試可調快）。
+  : "${CI_POLL_TRIES:=60}"
+  : "${CI_POLL_SLEEP:=10}"
+  tries=0
+  rid=""
+  while [ "$tries" -lt "$CI_POLL_TRIES" ]; do
+    rid="$(gh run list --branch "$b" --limit 20 \
+            --json databaseId,headSha \
+            -q ".[] | select(.headSha==\"$expect\") | .databaseId" 2>/dev/null | head -1 || true)"
+    [ -n "$rid" ] && break
+    tries=$(( tries + 1 ))
+    sleep "$CI_POLL_SLEEP"
+  done
+  [ -n "$rid" ] || { say "⚠️ 逾時：找不到 commit ${expect:0:8} 對應的 CI run（CI 未觸發或未啟用）"; return 2; }
+  # 二次確認該 run 的 headSha 確實==本輪 SHA（防競態抓錯）
+  head_sha="$(gh run view "$rid" --json headSha -q '.headSha' 2>/dev/null)"
+  [ "$head_sha" = "$expect" ] || { say "⚠️ run ${rid} 的 headSha(${head_sha:0:8}) 不等於本輪(${expect:0:8})，拒認"; return 2; }
   gh run watch "$rid" --exit-status >/dev/null 2>&1 && return 0 || return 1
 }
 
@@ -127,21 +183,25 @@ fi
 
 # ---------- 主：跑一輪 ----------
 guard_irreversible
+assert_test_cmd_safe   # TEST_CMD 白名單前置驗（die 在主流程才不被 subshell 吞）
 
 # init 狀態（首輪）
 [ -f "$STATE" ] || write_state iter=0 start_ts="$(now)" started="$(nowiso)"
 iter="$(read_state iter)"; iter="${iter:-0}"
 start="$(read_state start_ts)"; start="${start:-$(now)}"
 
+# ── 保險絲 A：迭代上限（codex#7 off-by-one 修正）──
+# 語意：最多跑 MAX_ITER 輪。iter 記的是「已完成的輪數」。
+#   若已完成 MAX_ITER 輪（iter >= MAX_ITER），本次不再起新一輪 → STOP。
+#   檢查放在自增【前】，故 MAX_ITER=8 時最後實際執行的是第 8 輪，第 9 次呼叫即停。
+if [ "$iter" -ge "$MAX_ITER" ]; then
+  say "🛑 STOP[保險絲/迭代]：已完成 ${iter} 輪，達 MAX_ITER=${MAX_ITER} 上限。停 + 回報人（貼最後紅項 + 最近 diff）。"
+  exit 3
+fi
+
 iter=$(( iter + 1 ))
 write_state iter="$iter" last_run="$(nowiso)"
 say "═══ Ship-PR loop 第 ${iter}/${MAX_ITER} 輪 ═══"
-
-# ── 保險絲 A：迭代上限 ──
-if [ "$iter" -gt "$MAX_ITER" ]; then
-  say "🛑 STOP[保險絲/迭代]：iter=${iter} 超過 MAX_ITER=${MAX_ITER}。停 + 回報人（貼最後紅項 + 最近 diff）。"
-  exit 3
-fi
 
 # ── 保險絲 B：牆鐘上限 ──
 elapsed=$(( $(now) - start ))
@@ -190,21 +250,31 @@ fi
 guard_irreversible
 say "✅ 本機測試全綠。push 到 feature 分支觸發遠端 CI（禁 force / 禁 main）…"
 b="$(cur_branch)"
-# 明確用普通 push（無 --force）；push 到 origin/<feature 同名>
-if ! git -C "$ROOT" push -u origin "$b" 2>&1 | tee /dev/stderr | grep -qiv "fatal"; then
-  : # push 結果由下方 CI 等待與 exit code 決定，這裡不武斷判失敗
+# codex#2：push 失敗即 FAIL，不可吞 exit code。明確用普通 push（無 --force）。
+if ! git -C "$ROOT" push -u origin "$b"; then
+  say "🔴 FAIL：push origin/${b} 失敗（網路 / 權限 / non-fast-forward）。"
+  say "   未推上＝沒有可被 CI 驗的遠端 commit。修好 push 問題再跑本 runner（禁用 --force 繞過）。"
+  exit 1
 fi
+# 取本輪實際 push 上去的 HEAD SHA，綁定後面要等的 CI run（codex#2）
+HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
+[ -n "$HEAD_SHA" ] || { say "🔴 FAIL：無法取得本輪 HEAD SHA。"; exit 1; }
 
-# ── 等遠端 CI ──
-wait_remote_ci; ci=$?
+# ── 等遠端 CI（綁定本輪 HEAD SHA）──
+# set -e 安全：用 `|| ci=$?` 取回傳碼，否則 wait_remote_ci 回非 0 會直接終止腳本。
+ci=0
+wait_remote_ci "$HEAD_SHA" || ci=$?
 case "$ci" in
-  0) say "🟢 PASS：本機綠 + 遠端 CI success。達標停 → 進 ④獨立驗收（換 session 跑 .claude/harness/independent-verify.sh）。"
-     write_state outcome="pass-pending-verify" passed_ts="$(nowiso)"
+  0) say "🟢 PASS：本機綠 + 遠端 CI success（commit ${HEAD_SHA:0:8}）。達標停 → 進 ④獨立驗收（換 session 跑 .claude/harness/independent-verify.sh）。"
+     write_state outcome="pass-verified" passed_ts="$(nowiso)" passed_sha="$HEAD_SHA"
      exit 0 ;;
   1) say "🔴 FAIL：本機綠但遠端 CI 紅（環境/整合差異）。把 CI 紅項當 failing 信號回去改。"
+     write_state outcome="fail-ci-red"
      exit 1 ;;
-  2) say "🟡 PASS(本機)：遠端 CI 不可用/未觸發，僅本機綠。"
-     say "   ⚠️ 缺遠端 CI 達標信號＝退化成本機自評（違反 §5 前提1）。請確認 ci.yml 已啟用且 PR 已開，再續。"
-     write_state outcome="pass-local-only" passed_ts="$(nowiso)"
-     exit 0 ;;
+  2) # codex#1：CI 不可用 / 未觸發 / 找不到本輪 SHA 的 run ≠ 達標。【不可】exit 0 放行為綠。
+     say "🛑 STOP[缺客觀 CI 信號]：遠端 CI 不可用 / 未觸發 / 找不到 commit ${HEAD_SHA:0:8} 對應的 run。"
+     say "   依 spec §2.2 達標鐵則：必須【本機綠 + 遠端 CI conclusion=success】。"
+     say "   缺遠端 CI＝無法達標，禁止當綠放行。請確認 ci.yml 已啟用且該 commit 觸發了 CI，再跑本 runner。"
+     write_state outcome="stop-no-ci"
+     exit 3 ;;
 esac

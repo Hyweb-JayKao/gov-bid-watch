@@ -38,15 +38,27 @@ bash .claude/harness/independent-verify.sh <PR_NUMBER>
 
 ## 三層終止（錨客觀信號，spec §2.2）
 
-| 層 | 條件 | 預設 | 行為 |
+| 層 | 條件 | 預設 | 行為 / exit |
 |----|------|------|------|
-| 達標停 | 本機 pytest 綠 + 遠端 CI success | — | 進 ④ |
-| 保險絲 | iter > `MAX_ITER` / 牆鐘 > `MAX_WALL` | 8 / 3600s | 停 + 回報人 |
-| 無進展停 | 連續 `NO_PROGRESS_N` 輪紅項分數沒降 | 3 | 停 + 回報人 |
+| 達標停 | 本機 pytest 綠 **且** 遠端 CI success（CI run 的 commit SHA 必須==本輪 HEAD）| — | exit 0 → 進 ④ |
+| 保險絲（迭代）| 已完成 `MAX_ITER` 輪後再呼叫即停（**最多跑 MAX_ITER 輪**；第 8 輪是最後一輪，第 9 次呼叫 STOP）| 8 | exit 3，停 + 回報人 |
+| 保險絲（牆鐘）| 牆鐘 > `MAX_WALL` | 3600s | exit 3 |
+| 無進展停 | 連續 `NO_PROGRESS_N` 輪紅項分數沒降 | 3 | exit 3 |
+| 缺客觀 CI 信號 | push 後找不到本輪 SHA 對應的 CI run / gh 不可用 / 逾時 | — | **exit 3 STOP**（不可當綠 exit 0）|
+| 本機綠但 CI 紅 / push 失敗 | — | — | exit 1 FAIL，回去改 |
+
+> ⚠️ **CI 不可用 ≠ 達標**（codex#1）：缺遠端 CI success 信號一律 STOP，禁退化成本機自評放行。
+> ⚠️ **CI run 必須對齊本輪 commit**（codex#2）：runner 只認 `headSha==本輪 HEAD` 的 run，不拿 branch 舊 run 充當成功；push 失敗即 FAIL。
 
 `TOKEN_BUDGET` 試點期先收 baseline 實測（agent 回填），再定預設。覆寫：`MAX_ITER=N bash ship-pr-loop.sh`。
+CI 輪詢覆寫：`CI_POLL_TRIES` / `CI_POLL_SLEEP`（預設 60 × 10s）。
 
 ## 不可逆邊界（鐵則，spec §2.3）
 
 runner 只做可逆動作：append commit / push feature 分支 / 開 PR。
-**禁** amend / rebase / force-push / push main / **auto-merge**——runner 偵測在受保護分支會 exit 2。merge 永遠人按。
+**禁** amend / rebase / force-push / push main / **auto-merge**。
+
+**受保護分支守門＝白名單制**（codex#3）：
+- 只有命中 `ALLOWED_FEATURE_RE`（預設 `feat|fix|chore|docs|test|refactor|perf|ci|build|style` 開頭）的 feature 分支可被 loop 動作。
+- `PROTECTED_RE`（`main|master|develop|release*|prod*|production*|hotfix*`）為第一層硬擋，與白名單**獨立兩層**——放寬任一層，另一層仍把關，故 env 無法繞過放行受保護分支。
+- 非 feature 分支 / 受保護分支 → exit 2 拒絕。merge 永遠人按。

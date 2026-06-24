@@ -38,11 +38,34 @@ def _write_stub(bindir: Path, name: str, body: str):
     p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _run(env_extra, iter0=0, scores=None, stub_git=None, stub_gh=None):
+# 行為類測試的預設「當前分支」：注入白名單內的 feature 分支名，讓 guard_irreversible
+# 不依賴 CI 實際 checkout 的 git 分支。CI 的 actions/checkout 是 detached HEAD（branch
+# 名＝"HEAD"），不注入的話 guard 會在跑到目標斷言前就因「HEAD 非 feature 分支」exit 2，
+# 造成本機在 feat/ 分支綠、CI 卻紅的環境回歸。注入後行為測試在任何 checkout 都一致。
+DEFAULT_TEST_BRANCH = "feat/harness-test"
+
+
+def _run(env_extra, iter0=0, scores=None, stub_git=None, stub_gh=None,
+         stub_branch=None):
     """跑一輪 runner，回 (returncode, stderr)。
 
     scores=預灌分數歷史；stub_git/stub_gh=注入假 git/gh 的 bash body（攔截危險路徑）。
+
+    branch context 一律由測試控制、不吃 CI 的 detached HEAD：在任何 stub_git（含 caller
+    自帶的 push/run-list stub）前一律先攔 `rev-parse --abbrev-ref HEAD`。caller 未指定
+    branch → 回 DEFAULT_TEST_BRANCH（白名單內 feature 分支，讓行為測試跑到目標斷言）。
+    需驗特定分支判定的測試走 _run_on_branch，由它指定 branch。
     """
+    # 一律前置「分支攔截」：使 guard_irreversible 看到的分支由測試決定，不受 CI detached
+    # HEAD（branch 名＝"HEAD"）影響。caller 自帶的 stub_git 內容接在攔截之後（push/gh
+    # run-list 等仍走 caller 的攔截，其餘 delegate 真 git）。
+    branch = stub_branch or DEFAULT_TEST_BRANCH
+    branch_intercept = (
+        'case "$*" in\n'
+        f'  *"rev-parse --abbrev-ref HEAD"*) echo "{branch}"; exit 0 ;;\n'
+        'esac\n'
+    )
+    stub_git = branch_intercept + (stub_git or 'exec "$REAL_GIT" "$@"\n')
     if STATE_DIR.exists():
         shutil.rmtree(STATE_DIR)
     STATE_DIR.mkdir(parents=True)
@@ -145,17 +168,11 @@ def _run_on_branch(branch, env_extra, **kw):
     """模擬「當前分支＝branch」跑 runner（驗受保護分支判定），不真的切 branch。
 
     不能在 worktree 切到 main（main 被另一 worktree 佔用，checkout 會失敗並污染後續
-    測試）。改注入 git stub：攔 `rev-parse --abbrev-ref HEAD` 回假 branch 名，其餘
-    git 子命令 delegate 真 git。guard 只看 cur_branch 的輸出，這樣即可精準驗分支判定。
+    測試）。改用 _run 的 stub_branch 注入：攔 `rev-parse --abbrev-ref HEAD` 回指定
+    branch 名，其餘 git 子命令 delegate 真 git。guard 只看 cur_branch 的輸出，這樣即
+    可精準驗分支判定（亦不受 CI detached HEAD 影響）。
     """
-    git_stub = (
-        'args="$*"\n'
-        'case "$args" in\n'
-        f'  *"rev-parse --abbrev-ref HEAD"*) echo "{branch}"; exit 0 ;;\n'
-        'esac\n'
-        'exec "$REAL_GIT" "$@"\n'
-    )
-    return _run(env_extra, stub_git=git_stub, **kw)
+    return _run(env_extra, stub_branch=branch, **kw)
 
 
 def test_protected_branch_hard_block():

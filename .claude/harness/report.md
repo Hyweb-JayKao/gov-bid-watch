@@ -84,3 +84,18 @@ runner 自測（子行程餵狀態檔），exit code 契約全符：
 1. ④ 探索測試 + AC 逐條對照：須換乾淨 session 派 qa-automation-architect（建者不自驗）。本 report 只完成機械半。
 2. merge：留 Jay。merge 前主 session 跑 /codex:adversarial-review 跨模型審 PR #20 diff。
 3. ci.yml 已加且 PR #20 實證能跑綠；若要設 main branch protection required check，屬 repo 設定＝人類動作。
+
+## 四點七、CI 紅修復：detached HEAD 環境回歸（2026-06-24）
+
+**症狀**：本機在 `feat/...` 分支 `116 passed`，但 PR #20 的 CI（run 28096163131）pytest **FAIL**。
+
+**根因（#3 修法引入的環境回歸）**：`actions/checkout` 預設 checkout 出來是 **detached HEAD**，`git rev-parse --abbrev-ref HEAD` 回 `HEAD`（非分支名）。#3 新加的 feature 分支白名單守門（`ALLOWED_FEATURE_RE`）命中「`HEAD` 非 feature 分支」→ `guard_irreversible` 在主流程開頭（runner line 204）**exit 2 搶先攔掉**，harness 行為測試（off-by-one / no-progress / local-red / push / ci 三態）全在跑到目標斷言前就被擋紅。本機在 feat/ 分支跑剛好命中白名單所以全綠，遮住了這個洞。
+
+**修法（只動測試、不動 runner）**：問題不在守門邏輯（守門擋 detached HEAD 是正確的——不該在無分支上下文跑不可逆動作），在於**行為測試不該依賴 CI 實際 checkout 的分支**。`tests/test_harness_loop.py` 的 `_run` 一律前置「分支攔截」stub：攔 `rev-parse --abbrev-ref HEAD` 回測試指定分支（行為測試預設 `feat/harness-test`，分支判定測試經 `_run_on_branch(stub_branch=...)` 指定），其餘 git 子命令照舊 delegate 真 git。branch context 由測試明確注入，與 runner 在哪個 checkout 跑無關。
+
+**未動 #3 protected 守門**：本次 diff **只改 `tests/test_harness_loop.py`**，`ship-pr-loop.sh` 一個字沒動 → #3 成果（`readonly PROTECTED_BUILTIN_RE` 內建常數、env 只能 `PROTECTED_EXTRA_RE` 收緊、白名單放寬越不過內建保護）原封保住，protected branch 仍不可被任何 env 組合繞過。
+
+**怎麼證明 detached HEAD 也綠**：worktree 內 `git checkout --detach`（`rev-parse --abbrev-ref HEAD` 確認回 `HEAD`，與 CI 同態）後跑 `pytest`：
+- `tests/test_harness_loop.py`：14 passed（修前同環境 3 failed）。
+- 全 repo：`116 passed, 5 xfailed`，與 feat/ 分支結果一致。
+re-attach 回 feat/ 分支後再跑亦 116 passed，兩態一致。

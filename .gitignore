@@ -30,3 +30,4 @@ data/tmp_*.csv
 .claude/skills/using-agent-skills
 .claude/commands/
 .claude/settings.local.json
+.claude/harness/.state/

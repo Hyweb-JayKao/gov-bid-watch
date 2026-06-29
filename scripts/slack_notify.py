@@ -66,7 +66,10 @@ def notify_freshness(latest_date: str, age_days, threshold_days: int,
     dry_run=False 但無 webhook → 不發送、reason='no_webhook'（安全降級）。
     """
     payload = build_freshness_payload(latest_date, age_days, threshold_days, source)
-    webhook = webhook or os.environ.get("SLACK_WEBHOOK_URL", "")
+    # #7：只在 webhook 為 None 才 fallback 到 env；明確傳入的空字串＝呼叫端
+    # 要求「不要 webhook」（測試在有 SLACK_WEBHOOK_URL 的環境也不會誤送真訊息）。
+    if webhook is None:
+        webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
 
     if dry_run:
         print("[slack dry-run] freshness payload:", file=sys.stderr)
@@ -90,7 +93,9 @@ def notify(rows: list, dry_run: bool = True, webhook: str = None) -> dict:
     dry_run=False 但無 webhook → 不發送、reason='no_webhook'（不報錯，安全降級）。
     """
     payload = build_payload(rows)
-    webhook = webhook or os.environ.get("SLACK_WEBHOOK_URL", "")
+    # #7：只在 webhook 為 None 才 fallback 到 env（空字串＝明確不送，見 notify_freshness）。
+    if webhook is None:
+        webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
 
     if dry_run:
         print("[slack dry-run] payload:", file=sys.stderr)

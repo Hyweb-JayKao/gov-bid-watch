@@ -24,6 +24,13 @@ on:
         description: "實際推 Slack？（true=推，預設 false=dry-run）"
         default: "false"
 
+# #3 併發保護（issue #22）：schedule 與 manual dispatch 同時跑會各推一次 Slack、
+# 且兩輪各自讀寫 watcher_state.json 造成節流失效 / 水位競態。同一 workflow 同時
+# 只允許一輪；後到者排隊（不取消正在跑的，避免半途中斷推播/水位寫入）。
+concurrency:
+  group: daily-watcher
+  cancel-in-progress: false
+
 jobs:
   watch:
     runs-on: ubuntu-latest

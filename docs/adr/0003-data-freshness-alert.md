@@ -49,9 +49,34 @@ pcc-tender 是「半月公開」資料，**正常供料下最新日期本就會�
 - **拿 weekly 當新鮮度依據**：錯——斷糧時 weekly 恆空，無法區分「今天剛好無新案」
   與「上游已死」。必須看 master 累積最大日期。
 
+## 健壯性修正（codex 跨模型審查 7 點，2026-06-29 補）
+
+PR #23 經 codex 獨立審查後，補以下 7 點（皆有回歸測試）：
+
+1. **dry-run 不消耗節流/不寫檔**（High）：原 dry-run 仍 `write_alert` + 更新
+   `state["freshness_alert"]`，手動 dry-run 後真推會被 `realert_days` 壓掉。改為
+   dry-run 只回報 `would_alert`，不落檔、不動 state。
+2. **壞掉的節流 state 不讓整輪 crash**（High）：`strptime(last_alert_date)` 包
+   try/except，異常 state（空字串/舊格式/殘留）視為「無有效節流」續推，不在 P0
+   diff/notify 前丟例外。
+3. **workflow 併發保護**（High）：`daily-watcher.yml` 加 `concurrency` group，
+   schedule 與 manual dispatch 不再各推一次、不再競態讀寫 state。
+4. **未來日期不遮蔽告警**（Medium）：`latest_data_date(today=...)` 忽略
+   `> today` 的髒行（如 `20991231`），避免成為最大日期使 age 變負、stale=False
+   遮蔽真斷糧。
+5. **master 讀取失敗只降級不中斷 P0**（Medium）：`run()` 把新鮮度檢查包
+   try/except，master 不存在/路徑錯/編碼錯 → 印 warning + `freshness={"error":...}`，
+   既有 P0 推播照常跑完。
+6. **時區明確用 Asia/Taipei**（Medium）：新增 `taipei_today()`，取代 runner UTC
+   的 `date.today()`，避免台北凌晨排程在 14 天門檻附近差 1 天誤判。
+7. **webhook 空字串不 fallback env**（Medium）：`notify`/`notify_freshness` 改為
+   只在 `webhook is None` 才讀 env；明確傳 `""`＝不送（測試在有 `SLACK_WEBHOOK_URL`
+   的環境也不會誤送真訊息）。
+
 ## 影響
 
 - 不動 `fetch_pcc.py`（換源是 issue #22 工項 2/3，未拍板，本 PR 不碰）。
-- 新增 `scripts/freshness.py`、`slack_notify.notify_freshness`、watcher `--master`/
-  `--freshness-days`、`daily-watcher.yml` 加 `--master data/bids.csv`。
-- 測試 baseline：92 → 105+（新增 `tests/test_freshness.py`）。
+- 新增 `scripts/freshness.py`（含 `taipei_today`）、`slack_notify.notify_freshness`、
+  watcher `--master`/`--freshness-days`、`daily-watcher.yml` 加 `--master data/bids.csv`
+  + `concurrency`。
+- 測試：全套 137 passed / 5 xfailed（`tests/test_freshness.py` 新增 7 點修正回歸）。

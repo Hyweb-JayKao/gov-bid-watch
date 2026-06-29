@@ -20,7 +20,7 @@ from datetime import date, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from freshness import check_freshness  # noqa: E402
+from freshness import check_freshness, taipei_today  # noqa: E402
 from p0_rules import is_p0  # noqa: E402
 from slack_notify import notify, notify_freshness  # noqa: E402
 from watcher_diff import (  # noqa: E402
@@ -72,17 +72,24 @@ def check_data_freshness(master_csv: str, state: dict, dry_run: bool,
                          today: date = None) -> dict:
     """偵測 master 資料源是否斷糧；stale 時推 Slack 告警（含重提節流）。
 
-    回傳 freshness dict（check_freshness 結果再加 alerted: bool）。
+    回傳 freshness dict（check_freshness 結果再加 alerted / would_alert: bool）。
     節流：同一停滯狀態（latest_date 不變）每 realert_days 天最多重提一次；
     latest_date 變動（資料前進或回退）視為新狀態，立即重提。
+
+    dry_run=True（issue #22 #1）：只回報「若真推會不會 alert」（would_alert），
+    **不寫 alert 檔、不更新節流狀態**。否則手動 dry-run 會消耗 realert_days
+    節流，把隨後的真推壓掉。
     """
-    today = today or date.today()
+    today = today or taipei_today()
     rows = read_rows(master_csv)
     fr = check_freshness(rows, freshness_days, today=today)
     fr["alerted"] = False
+    fr["would_alert"] = False
     if not fr["stale"]:
-        # 恢復供料 → 清掉節流紀錄，下次再斷糧能立即重提
-        state.pop("freshness_alert", None)
+        # 恢復供料 → 清掉節流紀錄，下次再斷糧能立即重提。
+        # dry-run 不改 state（#1）：只在真跑時清。
+        if not dry_run:
+            state.pop("freshness_alert", None)
         return fr
 
     prev = state.get("freshness_alert") or {}
@@ -90,8 +97,20 @@ def check_data_freshness(master_csv: str, state: dict, dry_run: bool,
     prev_date = prev.get("last_alert_date")
     should = True
     if prev_latest == fr["latest_date"] and prev_date:
-        prev_d = datetime.strptime(prev_date, "%Y-%m-%d").date()
-        should = (today - prev_d).days >= realert_days
+        # 壞掉的節流紀錄（空字串/舊格式/merge 殘留）→ 視為「無有效節流」續推（#2）
+        try:
+            prev_d = datetime.strptime(prev_date, "%Y-%m-%d").date()
+            should = (today - prev_d).days >= realert_days
+        except (ValueError, TypeError):
+            should = True
+
+    fr["would_alert"] = should
+    if dry_run:
+        # dry-run：印 payload 供 smoke，但不落 alert 檔、不動節流狀態（#1）
+        if should:
+            notify_freshness(fr["latest_date"], fr["age_days"], freshness_days,
+                             dry_run=True)
+        return fr
 
     if should:
         write_alert("data_freshness", {
@@ -123,10 +142,17 @@ def run(weekly_csv: str, state_path: str, dry_run: bool = True,
     state = load_state(state_path)
 
     # 0. 資料新鮮度檢查（issue #22）：與 P0 流程獨立，斷糧時即使 0 筆也告警。
+    #    #5：master 讀取/檢查失敗（檔不存在/路徑錯/編碼錯）只降級成 warning，
+    #    絕不讓既有 P0 推播流程停止——P0 是主業，新鮮度是附加守望。
     freshness = None
     if master_csv:
-        freshness = check_data_freshness(master_csv, state, dry_run,
-                                         freshness_days, realert_days, today=today)
+        try:
+            freshness = check_data_freshness(master_csv, state, dry_run,
+                                             freshness_days, realert_days, today=today)
+        except Exception as e:  # noqa: BLE001 — 任何 master 端錯誤都不得中斷 P0
+            print(f"::warning::[freshness] 新鮮度檢查失敗、已跳過（不影響 P0）：{e}",
+                  file=sys.stderr)
+            freshness = {"error": str(e), "stale": None, "alerted": False}
 
     rows = read_rows(weekly_csv)
 

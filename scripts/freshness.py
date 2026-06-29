@@ -11,7 +11,24 @@ mirror 2026-04 底起停更後，每天抓回 0 筆 → `no_p0` → 靜默不發
 
 閾值 N：見 watcher.py FRESHNESS_DAYS 的取值理由（為何不是 brief 初估的 3–5）。
 """
-from datetime import date
+from datetime import date, datetime
+
+try:
+    from zoneinfo import ZoneInfo
+    _TPE = ZoneInfo("Asia/Taipei")
+except Exception:  # 極端環境無 tzdata → 退回 naive（CI 已設 TZ）
+    _TPE = None
+
+
+def taipei_today() -> date:
+    """以 Asia/Taipei 為準的今天（issue #22 #6）。
+
+    CI runner 多為 UTC，台北凌晨排程用 UTC date 會差 1 天，14 天門檻附近誤判。
+    一律用台北日界線判斷停滯天數。
+    """
+    if _TPE is not None:
+        return datetime.now(_TPE).date()
+    return date.today()
 
 
 def _parse_yyyymmdd(s: str):
@@ -25,13 +42,23 @@ def _parse_yyyymmdd(s: str):
         return None
 
 
-def latest_data_date(rows: list) -> str:
+def latest_data_date(rows: list, today: date = None) -> str:
     """回傳 rows 中最大的 `date`（YYYYMMDD 字串）；無有效日期回 ''。
 
     用字串比較找最大（YYYYMMDD 字典序＝時間序），再驗證可解析，
     避免單一髒值（如 '99999999'）灌頂。
+
+    today 有給時忽略「未來日期」的髒行（issue #22 #4）：否則 `20991231`
+    這種壞資料會成為最大日期、age 變負、stale=False，把真斷糧遮蔽掉。
     """
-    valid = [r.get("date", "") for r in rows if _parse_yyyymmdd(r.get("date", ""))]
+    valid = []
+    for r in rows:
+        d = _parse_yyyymmdd(r.get("date", ""))
+        if d is None:
+            continue
+        if today is not None and d > today:
+            continue  # 未來日期＝髒資料，不採信
+        valid.append(r.get("date", "").strip())
     return max(valid) if valid else ""
 
 
@@ -44,8 +71,8 @@ def check_freshness(rows: list, threshold_days: int, today: date = None) -> dict
       - age_days: int|None  距今天數（無有效日期則 None）
       - threshold_days: int 用的閾值
     """
-    today = today or date.today()
-    latest = latest_data_date(rows)
+    today = today or taipei_today()
+    latest = latest_data_date(rows, today=today)
     if not latest:
         # 完全沒有有效日期 → 視為斷糧（資料集空或全髒）
         return {"stale": True, "latest_date": "", "age_days": None,

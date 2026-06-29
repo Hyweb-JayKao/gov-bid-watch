@@ -79,9 +79,19 @@ def period_to_key(period) -> str:
     return f"{y:04d}{mo:02d}{half:02d}"
 
 
+def valid_batch_key(filename: str) -> str:
+    """取 filename 的批次日期段，且通過 batch_period 合法性驗證才回傳；否則 ''。
+
+    擋 `tender_20260403.xml`（half 03）/`tender_20261302.xml`（月 13）這種非法值
+    污染 max() 排序與游標推進（codex #3）。
+    """
+    bk = batch_key(filename)
+    return bk if batch_period(bk) is not None else ""
+
+
 def latest_batch(rows: list) -> str:
-    """rows 中最大的批次日期段（'YYYYMM0H'）；無有效批次回 ''。"""
-    keys = [bk for r in rows if (bk := batch_key(r.get("filename", "")))]
+    """rows 中最大的「合法」批次日期段（'YYYYMM0H'）；無有效批次回 ''。"""
+    keys = [bk for r in rows if (bk := valid_batch_key(r.get("filename", "")))]
     return max(keys) if keys else ""
 
 

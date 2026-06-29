@@ -35,7 +35,7 @@ from tenacity import (
 
 # 軟體開發類過濾規則沿用 g0v fetcher（單一事實源，不重複維護）
 from fetch_bids import BLACKLIST, KEYWORDS, pre_filter  # noqa: E402
-from freshness import batch_key  # noqa: E402 — 批次日期段擷取（issue #22 方案 A）
+from freshness import valid_batch_key  # noqa: E402 — 合法批次日期段（issue #22 方案 A）
 
 
 # ---------- 暫時性錯誤 → 觸發 retry（永久性錯誤不重試，免燒配額）----------
@@ -257,9 +257,10 @@ def _month_windows(since, until):
 def pick_latest_batch_keys(filenames, n):
     """從一堆 filename 取最新 n 個不同批次日期段（'YYYYMM0H'，新→舊）。
 
-    純函式（無網路）：跨 tender_/award_ 前綴用 batch_key 統一成日期段去重再排序。
+    純函式（無網路）：跨 tender_/award_ 前綴統一成日期段、**只取合法批次**（擋
+    half 03 / 月 13 等髒值，codex #3）、去重再排序。
     """
-    keys = {bk for f in filenames if (bk := batch_key(f))}
+    keys = {bk for f in filenames if (bk := valid_batch_key(f))}
     return sorted(keys, reverse=True)[:n]
 
 

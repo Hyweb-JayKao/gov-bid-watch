@@ -68,12 +68,14 @@ def test_run_filters_non_p0(tmp_path):
     assert res["new"] == 2 and res["p0"] == 1   # 清潔被排除
 
 
-def test_run_second_pass_no_new(tmp_path):
+def test_run_second_pass_no_new(tmp_path, monkeypatch):
+    # dry-run 現為唯讀不持久化 → 用真跑（mock 送達成功）驗水位去重
+    monkeypatch.setattr(watcher, "notify", lambda *a, **k: {"sent": True, "reason": "ok"})
     csvp = tmp_path / "w.csv"
     statep = tmp_path / "s.json"
     _write_csv(csvp, [_p0_row(i) for i in range(3)])
-    watcher.run(str(csvp), str(statep), dry_run=True)   # 第一輪
-    res = watcher.run(str(csvp), str(statep), dry_run=True)  # 第二輪同檔
+    watcher.run(str(csvp), str(statep), dry_run=False)   # 第一輪
+    res = watcher.run(str(csvp), str(statep), dry_run=False)  # 第二輪同檔
     assert res["new"] == 0 and res["pushed"] == 0
 
 
@@ -82,7 +84,8 @@ def test_cost_cap_triggers_alert_no_push(tmp_path, monkeypatch):
     statep = tmp_path / "s.json"
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     _write_csv(csvp, [_p0_row(i) for i in range(25)])  # 25 > cap 20
-    res = watcher.run(str(csvp), str(statep), dry_run=True, push_cap=20)
+    # 真跑（capped 路徑不呼叫 notify，不會推真 Slack）
+    res = watcher.run(str(csvp), str(statep), dry_run=False, push_cap=20)
     assert res["status"] == "capped"
     assert res["pushed"] == 0
     assert res["alert"] is not None
@@ -99,7 +102,7 @@ def test_cost_cap_alert_includes_blocked_list(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     rows = [_p0_row(i, title=f"圖書館資訊系統建置-{i}") for i in range(25)]
     _write_csv(csvp, rows)
-    res = watcher.run(str(csvp), str(statep), dry_run=True, push_cap=20)
+    res = watcher.run(str(csvp), str(statep), dry_run=False, push_cap=20)
     payload = json.loads(Path(res["alert"]).read_text(encoding="utf-8"))
     blocked = payload["blocked_p0"]
     # 全部 25 筆被擋的 P0 都要在清單裡，且帶可辨識欄位
@@ -137,11 +140,12 @@ def test_empty_key_same_content_still_deduped(tmp_path):
     assert len(new) == 1
 
 
-def test_runlog_written(tmp_path):
+def test_runlog_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher, "notify", lambda *a, **k: {"sent": True, "reason": "ok"})
     csvp = tmp_path / "w.csv"
     statep = tmp_path / "s.json"
     _write_csv(csvp, [_p0_row(i) for i in range(2)])
-    watcher.run(str(csvp), str(statep), dry_run=True)
+    watcher.run(str(csvp), str(statep), dry_run=False)
     st = json.loads(statep.read_text(encoding="utf-8"))
     assert len(st["runs"]) == 1
     run = st["runs"][0]

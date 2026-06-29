@@ -21,10 +21,11 @@ from datetime import date, datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from freshness import (  # noqa: E402
-    batch_key,
+    batch_period,
     check_batch_freshness,
     latest_batch,
     taipei_today,
+    valid_batch_key,
 )
 from p0_rules import is_p0  # noqa: E402
 from slack_notify import notify, notify_freshness  # noqa: E402
@@ -144,22 +145,35 @@ def find_new_by_batch(rows: list, state: dict):
     批次** 的案子當新案，再經既有 seen_keys 去重（同批次重抓不重推）。
 
     回傳 (new_rows, mode, cand)：
-    - mode='fallback'：rows 完全沒有批次訊號（filename 全缺，非 pcc/舊資料）→ 退回
-      既有 seen_keys 水位法，向後相容（不讓無 filename 的資料整批靜默）。
-    - mode='baseline'：冷啟動（state 從未記過 last_batch）→ 只設基線、不回補整個歷史
-      backlog（否則首輪一次湧入數千案、必觸成本封頂），本輪不視為新案。
-    - mode='batch'：正常批次偵測，cand＝比 last_batch 新的批次的列。
+    - mode='fallback'：rows 完全沒有合法批次訊號（filename 全缺/全髒，非 pcc/舊資料）
+      → 退回既有 seen_keys 水位法，向後相容（不讓無 filename 的資料整批靜默）。
+    - mode='baseline'：冷啟動（state 從未記 last_batch）或 last_batch 壞掉（非法值，
+      codex #5）→ 只設基線、不回補整個歷史 backlog，本輪不視為新案。
+    - mode='batch'：正常批次偵測。cand＝比 last_batch 新的「合法批次」列；同份資料中
+      無/非法 filename 的列（codex #4）另走 seen_keys 水位法，不被靜默忽略。
     """
-    cur = latest_batch(rows)
+    cur = latest_batch(rows)   # 只看合法批次（#3）
     if not cur:
-        # 無任何批次訊號 → 退回水位法（drill abort / 非 pcc 測試資料仍可運作）
+        # 無任何合法批次訊號 → 退回水位法（drill abort / 非 pcc 測試資料仍可運作）
         return find_new(rows, state), "fallback", rows
     if "last_batch" not in state:
         return [], "baseline", []
     last_b = state.get("last_batch", "") or ""
+    # #5：壞掉的游標（舊格式/手改/merge 污染成非法值）→ 警告 + 重設基線，
+    #     不靠它判斷（否則合法新批次全判不出 → 靜默漏報）。
+    if batch_period(last_b) is None:
+        print(f"::warning::[batch] last_batch={last_b!r} 非法，重設基線（不推本輪）",
+              file=sys.stderr)
+        return [], "baseline", []
+    # 合法批次 > 游標 = 新批次候選
     cand = [r for r in rows
-            if (bk := batch_key(r.get("filename", ""))) and bk > last_b]
-    return find_new(cand, state), "batch", cand
+            if (bk := valid_batch_key(r.get("filename", ""))) and bk > last_b]
+    # #4：同份資料中無/非法 filename 的列 → 另走水位法，不靜默丟掉
+    no_batch = [r for r in rows if not valid_batch_key(r.get("filename", ""))]
+    new = find_new(cand, state)
+    if no_batch:
+        new = new + find_new(no_batch, state)
+    return new, "batch", cand
 
 
 def run(weekly_csv: str, state_path: str, dry_run: bool = True,
@@ -201,21 +215,44 @@ def run(weekly_csv: str, state_path: str, dry_run: bool = True,
     # 2. P0 布林過濾
     p0_rows = [r for r in new_rows if is_p0(r)]
 
+    # 批次缺口偵測（#2）：fetch 只抓最新 N 批，若 watcher 停跑/mirror 一次補多批，
+    # cur_batch 與游標的期距 > 本輪實際抓到的不同批次數 → 中間批次沒被抓到。
+    fetched_batches = len({valid_batch_key(r.get("filename", "")) for r in rows
+                           if valid_batch_key(r.get("filename", ""))})
+    gap = False
+    if mode == "batch" and cur_batch:
+        last_b = state.get("last_batch", "") or ""
+        span = batch_period(cur_batch) - batch_period(last_b)
+        gap = span > fetched_batches   # 期距比抓到的批次數還大 → 有沒抓到的中間批次
+
     result = {"fetched": len(rows), "new": len(new_rows),
               "p0": len(p0_rows), "pushed": 0, "status": "ok", "alert": None,
               "freshness": freshness, "batch": cur_batch,
-              "baseline": mode == "baseline", "mode": mode}
+              "baseline": mode == "baseline", "mode": mode, "gap": gap}
 
-    def _advance(note):
-        """收尾：推進批次游標 + 水位 + run-log + 存檔（各分支共用）。
+    # ── dry-run 一律唯讀（#1）：算完就回，不寫 alert / 不存 state ──
+    #    manual dispatch（push=false）會把 state commit 回 repo，若 dry-run 推進
+    #    游標，新批次被標已處理但 Slack 沒推 → 下次 schedule 同批不再推（漏報）。
+    if dry_run:
+        if mode != "baseline" and len(p0_rows) > push_cap:
+            result.update(status="capped")
+        else:
+            result["pushed"] = len(p0_rows)      # would-push（未真送）
+        result["push_reason"] = "dry_run"
+        return result
 
-        batch 模式只把本批候選列入水位（不灌入舊批次列汙染）；fallback 退回水位
-        法時則維持既有「整批列入」行為。游標 last_batch 隨已見最大批次前進。
+    # ── 以下為真跑（push 模式）：才有 disk 副作用 ──
+    def _persist(note, advance):
+        """run-log + 存檔；advance=True 才推進游標 + 把本輪列入水位。
+
+        advance=False（送失敗）→ 不 commit 水位也不推游標，下輪會重抓重試；
+        仍 save_state 以保住 freshness 節流 / run-log（送失敗不該連帶丟掉）。
         """
-        commit_watermark(cand if mode == "batch" else rows, state)
-        if cur_batch:
-            prev = state.get("last_batch", "") or ""
-            state["last_batch"] = max(cur_batch, prev)
+        if advance:
+            commit_watermark(cand if mode == "batch" else rows, state)
+            if cur_batch:
+                prev = state.get("last_batch", "") or ""
+                state["last_batch"] = max(cur_batch, prev)
         append_runlog(state, fetched=len(rows), new=len(new_rows),
                       pushed=result["pushed"], note=note)
         save_state(state, state_path)
@@ -228,6 +265,16 @@ def run(weekly_csv: str, state_path: str, dry_run: bool = True,
                       note=f"baseline batch={cur_batch or '-'}")
         save_state(state, state_path)
         return result
+
+    # 缺口留痕（#2）：仍推已抓批次，但警示人工 backfill 沒抓到的中間批次
+    if gap:
+        write_alert("batch_gap", {
+            "last_batch": state.get("last_batch", ""), "cur_batch": cur_batch,
+            "fetched_batches": fetched_batches,
+            "hint": "fetch 只抓最新批次、中間有批次沒抓到（watcher 久停/mirror 補多批）。"
+                    "請用 fetch_pcc.py --since 回補後再跑，免漏標案。見 issue #22。",
+        })
+        result["alert"] = "batch_gap"
 
     # 4. 成本封頂：推播候選過多 → 規則錯/資料異常 → 不推、alert
     #    ⚠️ 0 漏報鐵則（issue #14 §4）：capped 時游標仍前進，被擋的 P0 下輪
@@ -243,17 +290,22 @@ def run(weekly_csv: str, state_path: str, dry_run: bool = True,
             "blocked_p0": blocked,  # 被擋的完整清單，供人工補救（游標已前進）
         })
         result.update(status="capped", alert=alert)
-        _advance(f"CAPPED p0={len(p0_rows)}>{push_cap} batch={cur_batch}")
+        _persist(f"CAPPED p0={len(p0_rows)}>{push_cap} batch={cur_batch}",
+                 advance=True)
         return result
 
-    # 5. 推播（dry-run 預設）
-    push_res = notify(p0_rows, dry_run=dry_run) if p0_rows else \
+    # 5. 推播
+    push_res = notify(p0_rows, dry_run=False) if p0_rows else \
         {"sent": False, "count": 0, "reason": "no_p0"}
-    result["pushed"] = len(p0_rows) if (push_res.get("sent") or dry_run) else 0
+    delivered = bool(push_res.get("sent")) or push_res.get("reason") == "no_p0"
+    result["pushed"] = len(p0_rows) if push_res.get("sent") else 0
     result["push_reason"] = push_res.get("reason")
 
-    # 6. 推進游標 + 水位 + run-log
-    _advance(f"dry_run={dry_run} p0={len(p0_rows)} batch={cur_batch}")
+    # 6. 推進游標 + 水位 + run-log。
+    #    ⚠️ 只在「真的送達」或「本來就沒 P0 可送」才推進（#1）：送失敗（webhook
+    #    錯/降級）不推進、不列入水位，下輪重抓該批重試，免新案被標已處理卻沒送出。
+    _persist(f"push p0={len(p0_rows)} sent={push_res.get('sent')} batch={cur_batch}",
+             advance=delivered)
     return result
 
 

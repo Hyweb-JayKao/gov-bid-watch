@@ -137,38 +137,125 @@ def test_notify_freshness_no_webhook_safe_degrade():
     assert res["sent"] is False and res["reason"] == "no_webhook"
 
 
-# ---------- watcher 批次新案偵測 ----------
+# ---------- watcher 批次新案偵測（真跑路徑：dry-run 唯讀不持久化）----------
+def _mock_sent(monkeypatch):
+    monkeypatch.setattr(watcher, "notify", lambda *a, **k: {"sent": True, "reason": "ok"})
+
+
 def test_cold_start_sets_baseline_no_push(tmp_path):
     """冷啟動：只設批次基線、不回補歷史 backlog、不推。"""
     weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
     _write_weekly(weekly, batch="tender_20260402.xml", n=3)
-    res = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)
+    res = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)
     assert res["baseline"] is True and res["new"] == 0 and res["pushed"] == 0
     saved = json.loads(state.read_text(encoding="utf-8"))
     assert saved["last_batch"] == "20260402"   # 基線已記
 
 
-def test_new_batch_detected_and_pushed(tmp_path):
+def test_new_batch_detected_and_pushed(tmp_path, monkeypatch):
     """已處理到 0401，出現 0402 新批次 → 該批 P0 被推。"""
+    _mock_sent(monkeypatch)
     weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
     _write_weekly(weekly, batch="tender_20260401.xml", n=1)
-    watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)   # baseline 0401
+    watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)   # baseline 0401
     _write_weekly(weekly, batch="tender_20260402.xml", n=2)
-    res = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)
+    res = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)
     assert res["baseline"] is False and res["new"] == 2 and res["p0"] == 2
     assert res["pushed"] == 2 and res["batch"] == "20260402"
     assert json.loads(state.read_text(encoding="utf-8"))["last_batch"] == "20260402"
 
 
-def test_same_batch_not_repushed(tmp_path):
+def test_same_batch_not_repushed(tmp_path, monkeypatch):
     """同一批次再跑 → 不重複當新案。"""
+    _mock_sent(monkeypatch)
     weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
     _write_weekly(weekly, batch="tender_20260401.xml", n=1)
-    watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)   # baseline 0401
+    watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)   # baseline 0401
     _write_weekly(weekly, batch="tender_20260402.xml", n=1)
-    watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)   # 推 0402
-    r3 = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)  # 再跑同批
+    watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)   # 推 0402
+    r3 = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)  # 再跑同批
     assert r3["new"] == 0 and r3["pushed"] == 0
+
+
+# ---------- codex 批次重寫 5 點修正回歸 ----------
+def test_dry_run_does_not_persist_state(tmp_path):
+    """#1：dry-run 唯讀——不推進游標、不寫 state（manual dispatch commit 不毒化）。"""
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    _write_weekly(weekly, batch="tender_20260402.xml", n=2)
+    res = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)
+    assert res["pushed"] == 2 or res["baseline"]   # 回報 would-push
+    assert not state.exists()                        # 完全沒寫 state
+
+
+def test_failed_push_does_not_advance_cursor(tmp_path, monkeypatch):
+    """#1：真推但 Slack 送失敗 → 不推進游標、下輪重抓重試。"""
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    _write_weekly(weekly, batch="tender_20260401.xml", n=1)
+    monkeypatch.setattr(watcher, "notify", lambda *a, **k: {"sent": True})
+    watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)   # baseline 0401
+    _write_weekly(weekly, batch="tender_20260402.xml", n=1)
+    monkeypatch.setattr(watcher, "notify",
+                        lambda *a, **k: {"sent": False, "reason": "no_webhook"})
+    r1 = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)  # 送失敗
+    assert r1["pushed"] == 0
+    assert json.loads(state.read_text(encoding="utf-8"))["last_batch"] == "20260401"
+    monkeypatch.setattr(watcher, "notify", lambda *a, **k: {"sent": True})
+    r2 = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)  # 重試送達
+    assert r2["new"] == 1 and r2["pushed"] == 1
+    assert json.loads(state.read_text(encoding="utf-8"))["last_batch"] == "20260402"
+
+
+def test_batch_gap_detected_and_alerted(tmp_path, monkeypatch):
+    """#2：游標停在 0301，這輪只抓到 0402（中間 0302/0401 沒抓）→ 缺口告警。"""
+    monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify", lambda *a, **k: {"sent": True})
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    state.write_text(json.dumps({"last_batch": "20260301", "seen_keys": [],
+                                 "runs": []}), encoding="utf-8")
+    _write_weekly(weekly, batch="tender_20260402.xml", n=1)   # 只抓到 1 批、期距 3
+    res = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)
+    assert res["gap"] is True and res["alert"] == "batch_gap"
+    assert list((tmp_path / "alerts").glob("*batch_gap*.json"))
+
+
+def test_invalid_batch_key_not_cursor():
+    """#3：非法 filename（half 03 / 月 13）不進游標、不被當最新批次。"""
+    from freshness import valid_batch_key
+    assert valid_batch_key("tender_20260403.xml") == ""   # half 03 非法
+    assert valid_batch_key("tender_20261302.xml") == ""   # 月 13 非法
+    rows = [{"filename": "tender_20260403.xml"}, {"filename": "tender_20260302.xml"}]
+    assert latest_batch(rows) == "20260302"   # 非法值不灌頂
+
+
+def test_mixed_filename_no_batch_rows_not_silently_dropped(tmp_path, monkeypatch):
+    """#4：同份資料部分無 filename 的列改走水位法，不被靜默忽略。"""
+    _mock_sent(monkeypatch)
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    _write_weekly(weekly, batch="tender_20260401.xml", n=1)
+    watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)   # baseline 0401
+    with open(weekly, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=WEEKLY_COLS)
+        w.writeheader()
+        w.writerow({"unit_id": "B1", "job_number": "BJ1", "date": "20260315",
+                    "title": "資訊系統開發", "unit_name": "經濟部", "type": "公開招標",
+                    "url": "", "category": "勞務類", "filename": "tender_20260402.xml"})
+        w.writerow({"unit_id": "N1", "job_number": "NJ1", "date": "20260315",
+                    "title": "資訊系統開發", "unit_name": "經濟部", "type": "公開招標",
+                    "url": "", "category": "勞務類", "filename": ""})
+    res = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)
+    assert res["new"] == 2 and res["pushed"] == 2   # 批次列 + 無 filename 列都被推
+
+
+def test_broken_cursor_resets_baseline(tmp_path, monkeypatch):
+    """#5：壞掉的 last_batch（非法值）→ 重設基線、不靜默漏報。"""
+    _mock_sent(monkeypatch)
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    state.write_text(json.dumps({"last_batch": "garbage", "seen_keys": [],
+                                 "runs": []}), encoding="utf-8")
+    _write_weekly(weekly, batch="tender_20260402.xml", n=2)
+    res = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)
+    assert res["baseline"] is True   # 壞游標 → 重設基線
+    assert json.loads(state.read_text(encoding="utf-8"))["last_batch"] == "20260402"
 
 
 # ---------- watcher 新鮮度整合 ----------

@@ -65,6 +65,28 @@ watcher 的新案偵測與新鮮度判斷都改用批次。
 7. webhook 空字串不 fallback env（測試環境不誤送）。
 8. 節流只在 `notify_freshness` 回傳 `sent=True` 才啟動（沒送達不消耗 realert 窗）。
 
+## 批次重寫的 codex 第三輪審查 5 點（2026-06-29 補）
+
+1. **dry-run 唯讀**（High）：dry-run 不再寫 alert / 不推進游標 / 不存 state（manual
+   dispatch 會把 state commit 回 repo，dry-run 推進游標會讓新批次被標已處理卻沒推 →
+   下次 schedule 同批不再推）。真跑時游標/水位**只在送達（sent=True 或本就 no_p0）
+   才推進**，送失敗不推進、下輪重抓重試。
+2. **批次缺口偵測**（High）：fetch 只抓最新 N 批，若 watcher 久停/mirror 一次補多批，
+   `cur_batch` 與游標期距 > 本輪實抓批次數 → 中間批次沒抓到。偵測到缺口寫 `batch_gap`
+   alert 提示人工 `--since` 回補，不靜默跳過。
+3. **非法批次值不污染**（Medium）：新增 `valid_batch_key`（過 `batch_period` 驗證），
+   `latest_batch` / `pick_latest_batch_keys` / 游標比較全改用合法 key，擋 half 03 /
+   月 13 等髒值灌頂排序或推進游標。
+4. **混合資料不靜默丟列**（Medium）：batch 模式下同份資料中無/非法 filename 的列
+   另走 seen_keys 水位法（不再只有「全部沒批次」才 fallback），免部分無 filename 的
+   列既不進 cand 也不走水位 → 永久不推。
+5. **壞游標降級**（Medium）：讀 state 的 `last_batch` 先驗 `batch_period`，非法
+   （舊格式/手改/merge 污染）→ 警告 + 重設基線，免合法新批次全判不出而靜默漏報。
+
+> ⚠️ 連帶語意變更：dry-run 改為**完全唯讀**（原 pilot 期 dry-run 會推進水位）。
+> drill_abort 改成直接 `commit_watermark` 種水位 + 真跑 capped 路徑（不呼叫 notify、
+> 無 webhook → 不推真 Slack）；相依的 watcher 測試改走真跑 + mock 送達。
+
 ## 取捨 / 替代方案
 
 - **沿用公告日距今**（初稿）：作廢——量錯對象，健康狀態天天誤報。
@@ -84,8 +106,9 @@ watcher 的新案偵測與新鮮度判斷都改用批次。
   新鮮度（`check_data_freshness`），state 新增 `last_batch`。
 - `slack_notify.py`：freshness payload 改批次語意（最新批次 / 預期批次 / 落後期數）。
 - `daily-watcher.yml`：fetch 改 `--latest-batches 3`、watcher 用 `--freshness-grace`。
-- 測試：全套 146 passed / 5 xfailed（`tests/test_freshness.py` 重寫為批次模型 +
-  `tests/test_fetch_batches.py` 批次抓取純函式）。
+- 測試：全套 152 passed / 5 xfailed（`tests/test_freshness.py` 批次模型 + 5 點修正回歸、
+  `tests/test_fetch_batches.py` 批次抓取純函式；`tests/test_watcher.py` / `drill_abort`
+  配合 dry-run 唯讀語意改真跑）。
 
 ## ⚠️ 待 CI 實測（本機無 token / MCP 不可用，無法在開發 session 驗）
 

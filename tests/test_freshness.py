@@ -1,9 +1,10 @@
-"""資料新鮮度告警 unit test（issue #22）。
+"""資料新鮮度告警 + 批次新案偵測 unit test（issue #22，方案 A 批次節奏版）。
 
-驗收（brief）：
-- master 最新日期 > N 天前 → 推一則 Slack 新鮮度告警（含資料源/最新日期/距今天數）
-- 正常供料時不誤報
-- 有可自動驗證的測試
+根因翻轉後（見 ADR 0003）：官方天生 ~2 月延遲、半月批次發布（filename=YYYYMM0H）。
+- 新案偵測：以批次 filename 為錨，只推「比已處理批次新」的批次（廢除公告日窗）。
+- 新鮮度：以「最新批次有沒有如期出現」判，不用公告日距今。
+- 保留 PR #23 健壯性：節流(只在 sent=True)/dry-run 無副作用/Asia-Taipei/webhook 邊界/
+  壞 state 不 crash/master 失敗不中斷 P0。
 """
 import csv
 import json
@@ -14,281 +15,309 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import watcher  # noqa: E402
-from freshness import check_freshness, latest_data_date  # noqa: E402
+from freshness import (  # noqa: E402
+    batch_key,
+    batch_period,
+    check_batch_freshness,
+    expected_latest_batch_period,
+    latest_batch,
+    period_to_key,
+    taipei_today,
+)
 from slack_notify import build_freshness_payload, notify_freshness  # noqa: E402
 
-TODAY = date(2026, 6, 29)
+TODAY = date(2026, 6, 29)   # 預期最新批次 = 2026-04 下半月（20260402）
+
+MASTER_COLS = ["unit_id", "job_number", "date", "title", "filename"]
+WEEKLY_COLS = ["unit_id", "job_number", "date", "title", "unit_name", "type",
+               "url", "category", "filename"]
 
 
-def _rows(*dates):
-    return [{"date": d, "title": "x", "unit_id": "U", "job_number": "J"} for d in dates]
+def _master_rows(*batch_files):
+    return [{"unit_id": f"U{i}", "job_number": f"J{i}", "date": "20260301",
+             "title": f"案{i}", "filename": fn} for i, fn in enumerate(batch_files)]
 
 
-def _write_master(path, *dates):
-    cols = ["unit_id", "job_number", "date", "title"]
+def _write_master(path, *batch_files):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=MASTER_COLS)
         w.writeheader()
-        for i, d in enumerate(dates):
-            w.writerow({"unit_id": f"U{i}", "job_number": f"J{i}", "date": d,
-                        "title": f"案{i}"})
+        for r in _master_rows(*batch_files):
+            w.writerow(r)
 
 
-def _write_weekly(path, n=0):
-    cols = ["unit_id", "job_number", "date", "title", "unit_name", "type",
-            "url", "category"]
+def _write_weekly(path, batch=None, n=0):
+    """寫 n 筆 P0 候選（勞務類 + 軟體關鍵字 + 白名單機關），都屬批次 batch。"""
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=WEEKLY_COLS)
         w.writeheader()
         for i in range(n):
             w.writerow({"unit_id": f"W{i}", "job_number": f"WJ{i}",
-                        "date": "20260629", "title": "新案", "unit_name": "機關",
-                        "type": "公開招標", "url": "", "category": "勞務類"})
+                        "date": "20260315", "title": "資訊系統開發",
+                        "unit_name": "經濟部", "type": "公開招標",
+                        "url": "", "category": "勞務類",
+                        "filename": batch or "tender_20260402.xml"})
 
 
-# ---------- freshness 純函式 ----------
-def test_latest_data_date_picks_max():
-    assert latest_data_date(_rows("20260101", "20260504", "20260315")) == "20260504"
+# ---------- 批次識別純函式 ----------
+def test_batch_key_strips_prefix():
+    assert batch_key("tender_20260402.xml") == "20260402"
+    assert batch_key("award_20260402.xml") == "20260402"   # 跨前綴統一
+    assert batch_key("") == "" and batch_key("nope.xml") == ""
 
 
-def test_latest_data_date_ignores_dirty():
-    assert latest_data_date(_rows("20260504", "99999999", "", "abc")) == "20260504"
+def test_batch_period_and_roundtrip():
+    p = batch_period("20260402")            # 4 月下半月
+    assert p == 2026 * 24 + (4 - 1) * 2 + 1
+    assert period_to_key(p) == "20260402"
+    assert batch_period("20260401") == p - 1   # 相鄰半月差 1
+    assert period_to_key(p - 1) == "20260401"
 
 
-def test_check_freshness_stale():
-    fr = check_freshness(_rows("20260504"), 14, today=TODAY)
-    assert fr["stale"] is True and fr["latest_date"] == "20260504"
-    assert fr["age_days"] == 56
+def test_batch_period_rejects_dirty():
+    assert batch_period("20261302") is None   # 月 13 非法
+    assert batch_period("20260403") is None   # half 03 非法（僅 01/02）
+    assert batch_period("abc") is None and batch_period("") is None
 
 
-def test_check_freshness_fresh_within_threshold():
-    # 距今 10 天 < 14 → 不誤報（模擬假期空窗的正常供料）
-    fr = check_freshness(_rows("20260619"), 14, today=TODAY)
-    assert fr["stale"] is False and fr["age_days"] == 10
+def test_latest_batch_picks_max_across_prefix():
+    rows = [{"filename": "tender_20260302.xml"}, {"filename": "award_20260402.xml"},
+            {"filename": "tender_20260401.xml"}]
+    assert latest_batch(rows) == "20260402"
 
 
-def test_check_freshness_empty_is_stale():
-    fr = check_freshness([], 14, today=TODAY)
-    assert fr["stale"] is True and fr["latest_date"] == "" and fr["age_days"] is None
+def test_expected_latest_batch_cadence():
+    # 6/29（>=5 號）→ 預期 4 月下半月（今天 -2 月）
+    assert period_to_key(expected_latest_batch_period(date(2026, 6, 29))) == "20260402"
+    # 6/3（<5 號，發布日前）→ 保守抓 3 月下半月（今天 -3 月）
+    assert period_to_key(expected_latest_batch_period(date(2026, 6, 3))) == "20260302"
+
+
+# ---------- check_batch_freshness ----------
+def test_freshness_stale_when_behind_two_periods():
+    # TwinkleAI 卡 20260302、預期 20260402 → 落後 2 期 → 斷糧（實證情境）
+    fr = check_batch_freshness(_master_rows("tender_20260302.xml"), today=TODAY)
+    assert fr["stale"] is True
+    assert fr["latest_batch"] == "20260302" and fr["expected_batch"] == "20260402"
+    assert fr["lag_periods"] == 2
+
+
+def test_freshness_fresh_when_on_cadence():
+    fr = check_batch_freshness(_master_rows("award_20260402.xml"), today=TODAY)
+    assert fr["stale"] is False and fr["lag_periods"] == 0
+
+
+def test_freshness_tolerates_one_period_lag():
+    # 落後 1 期（剛好某半月還沒發）→ 不誤報
+    fr = check_batch_freshness(_master_rows("tender_20260401.xml"), today=TODAY)
+    assert fr["lag_periods"] == 1 and fr["stale"] is False
+
+
+def test_freshness_empty_is_stale():
+    fr = check_batch_freshness([], today=TODAY)
+    assert fr["stale"] is True and fr["latest_batch"] == "" and fr["lag_periods"] is None
 
 
 # ---------- Slack payload ----------
-def test_freshness_payload_contains_required_facts():
-    p = build_freshness_payload("20260504", 56, 14, source="pcc-tender")
+def test_freshness_payload_contains_batch_facts():
+    p = build_freshness_payload("20260302", "20260402", 2)
     txt = json.dumps(p, ensure_ascii=False)
-    assert "pcc-tender" in txt          # 資料源
-    assert "2026-05-04" in txt          # 最新日期
-    assert "56" in txt                  # 距今天數
+    assert "pcc-tender" in txt and "20260302" in txt and "20260402" in txt
+    assert "2026-03" in txt and "2026-04" in txt     # 人話化批次
     assert p["blocks"][0]["type"] == "header"
 
 
 def test_notify_freshness_dry_run_no_send():
-    res = notify_freshness("20260504", 56, 14, dry_run=True)
+    res = notify_freshness("20260302", "20260402", 2, dry_run=True)
     assert res["sent"] is False and res["reason"] == "dry_run"
 
 
 def test_notify_freshness_no_webhook_safe_degrade():
-    res = notify_freshness("20260504", 56, 14, dry_run=False, webhook="")
+    res = notify_freshness("20260302", "20260402", 2, dry_run=False, webhook="")
     assert res["sent"] is False and res["reason"] == "no_webhook"
 
 
-# ---------- watcher 整合 ----------
+# ---------- watcher 批次新案偵測 ----------
+def test_cold_start_sets_baseline_no_push(tmp_path):
+    """冷啟動：只設批次基線、不回補歷史 backlog、不推。"""
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    _write_weekly(weekly, batch="tender_20260402.xml", n=3)
+    res = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)
+    assert res["baseline"] is True and res["new"] == 0 and res["pushed"] == 0
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["last_batch"] == "20260402"   # 基線已記
+
+
+def test_new_batch_detected_and_pushed(tmp_path):
+    """已處理到 0401，出現 0402 新批次 → 該批 P0 被推。"""
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    _write_weekly(weekly, batch="tender_20260401.xml", n=1)
+    watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)   # baseline 0401
+    _write_weekly(weekly, batch="tender_20260402.xml", n=2)
+    res = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)
+    assert res["baseline"] is False and res["new"] == 2 and res["p0"] == 2
+    assert res["pushed"] == 2 and res["batch"] == "20260402"
+    assert json.loads(state.read_text(encoding="utf-8"))["last_batch"] == "20260402"
+
+
+def test_same_batch_not_repushed(tmp_path):
+    """同一批次再跑 → 不重複當新案。"""
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
+    _write_weekly(weekly, batch="tender_20260401.xml", n=1)
+    watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)   # baseline 0401
+    _write_weekly(weekly, batch="tender_20260402.xml", n=1)
+    watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)   # 推 0402
+    r3 = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)  # 再跑同批
+    assert r3["new"] == 0 and r3["pushed"] == 0
+
+
+# ---------- watcher 新鮮度整合 ----------
 def test_run_stale_master_fires_freshness(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
-    weekly = tmp_path / "w.csv"
-    state = tmp_path / "s.json"
-    master = tmp_path / "m.csv"
-    _write_weekly(weekly, n=0)               # 斷糧：本輪 0 筆
-    _write_master(master, "20260504")        # master 卡在 56 天前
+    weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
+    _write_weekly(weekly, n=0)
+    _write_master(master, "tender_20260302.xml")   # 卡 3 月下半月 → 落後 2 期
     res = watcher.run(str(weekly), str(state), dry_run=False,
                       master_csv=str(master), today=TODAY)
-    assert res["freshness"]["stale"] is True
-    assert res["freshness"]["alerted"] is True
-    # 寫了 data_freshness alert 檔
+    assert res["freshness"]["stale"] is True and res["freshness"]["alerted"] is True
     alerts = list((tmp_path / "alerts").glob("*data_freshness*.json"))
     assert len(alerts) == 1
     payload = json.loads(alerts[0].read_text(encoding="utf-8"))
-    assert payload["latest_date"] == "20260504" and payload["age_days"] == 56
+    assert payload["latest_batch"] == "20260302" and payload["lag_periods"] == 2
 
 
 def test_run_fresh_master_no_alert(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
-    weekly = tmp_path / "w.csv"
-    state = tmp_path / "s.json"
-    master = tmp_path / "m.csv"
+    weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
-    _write_master(master, "20260628")        # 1 天前 → 正常
+    _write_master(master, "award_20260402.xml")     # 如期 → 不報
     res = watcher.run(str(weekly), str(state), dry_run=True,
                       master_csv=str(master), today=TODAY)
-    assert res["freshness"]["stale"] is False
-    assert res["freshness"]["alerted"] is False
+    assert res["freshness"]["stale"] is False and res["freshness"]["alerted"] is False
     assert not list((tmp_path / "alerts").glob("*data_freshness*.json"))
 
 
 def test_run_no_master_skips_freshness(tmp_path):
-    # 不給 master → 完全不做新鮮度檢查（保護既有流程/舊測試）
-    weekly = tmp_path / "w.csv"
-    state = tmp_path / "s.json"
+    weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
     _write_weekly(weekly, n=0)
     res = watcher.run(str(weekly), str(state), dry_run=True, today=TODAY)
     assert res["freshness"] is None
 
 
 def test_freshness_realert_throttled(tmp_path, monkeypatch):
-    """同一停滯狀態隔天再跑 → 節流不重複轟炸（< realert_days）。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
-    weekly = tmp_path / "w.csv"
-    state = tmp_path / "s.json"
-    master = tmp_path / "m.csv"
+    weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
-    _write_master(master, "20260504")
+    _write_master(master, "tender_20260302.xml")
     r1 = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
                      realert_days=3, today=date(2026, 6, 29))
     r2 = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
-                     realert_days=3, today=date(2026, 6, 30))  # 隔 1 天 < 3
+                     realert_days=3, today=date(2026, 6, 30))   # 隔 1 天 < 3
     assert r1["freshness"]["alerted"] is True
     assert r2["freshness"]["alerted"] is False
-    # 只寫了 1 個 alert 檔
     assert len(list((tmp_path / "alerts").glob("*data_freshness*.json"))) == 1
 
 
 def test_freshness_realert_after_interval(tmp_path, monkeypatch):
-    """超過 realert_days 仍斷糧 → 重提一次。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
-    weekly = tmp_path / "w.csv"
-    state = tmp_path / "s.json"
-    master = tmp_path / "m.csv"
+    weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
-    _write_master(master, "20260504")
+    _write_master(master, "tender_20260302.xml")
     watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
                 realert_days=3, today=date(2026, 6, 29))
     r2 = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
-                     realert_days=3, today=date(2026, 7, 3))  # 隔 4 天 >= 3
+                     realert_days=3, today=date(2026, 7, 3))    # 隔 4 天 >= 3
     assert r2["freshness"]["alerted"] is True
     assert len(list((tmp_path / "alerts").glob("*data_freshness*.json"))) == 2
 
 
 def test_freshness_recovery_clears_throttle(tmp_path, monkeypatch):
-    """斷糧→恢復供料→再斷糧：恢復時清節流，再斷糧能立即重提。"""
-    monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
-    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
-    weekly = tmp_path / "w.csv"
-    state = tmp_path / "s.json"
-    master = tmp_path / "m.csv"
-    _write_weekly(weekly, n=0)
-    # 斷糧
-    _write_master(master, "20260504")
-    watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
-                realert_days=3, today=date(2026, 6, 29))
-    # 恢復供料
-    _write_master(master, "20260629")
-    watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
-                realert_days=3, today=date(2026, 6, 29))
-    # 再次斷糧（同一最新日期但已恢復過）→ 立即重提
-    _write_master(master, "20260504")
-    r = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
-                    realert_days=3, today=date(2026, 6, 30))
-    assert r["freshness"]["alerted"] is True
-
-
-# ---------- codex 跨模型審查 7 點修正回歸（issue #22）----------
-def test_dry_run_does_not_consume_throttle_or_write(tmp_path, monkeypatch):
-    """#1：dry-run 只回報 would_alert，不寫 alert 檔、不更新節流 state。
-
-    回歸 codex High#1：dry-run 若更新節流，隨後真推會被 realert_days 壓掉。
-    """
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
-    _write_master(master, "20260504")
+    _write_master(master, "tender_20260302.xml")            # 斷糧
+    watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
+                realert_days=3, today=date(2026, 6, 29))
+    _write_master(master, "award_20260402.xml")             # 恢復如期
+    watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
+                realert_days=3, today=date(2026, 6, 29))
+    _write_master(master, "tender_20260302.xml")            # 再斷糧（同批次）
+    r = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
+                    realert_days=3, today=date(2026, 6, 30))
+    assert r["freshness"]["alerted"] is True   # 恢復清了節流 → 立即重提
+
+
+# ---------- PR #23 健壯性回歸（沿用，改批次語意）----------
+def test_dry_run_does_not_consume_throttle_or_write(tmp_path, monkeypatch):
+    """#1：dry-run 只回報 would_alert，不寫 alert 檔、不更新節流 state。"""
+    monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
+    weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
+    _write_weekly(weekly, n=0)
+    _write_master(master, "tender_20260302.xml")
     dr = watcher.run(str(weekly), str(state), dry_run=True, master_csv=str(master),
                      realert_days=3, today=TODAY)
-    assert dr["freshness"]["would_alert"] is True   # 會 alert（若真推）
-    assert dr["freshness"]["alerted"] is False       # 但 dry-run 沒真推
-    assert not list((tmp_path / "alerts").glob("*data_freshness*.json"))  # 沒寫檔
-    assert not state.exists() or "freshness_alert" not in json.loads(
-        state.read_text(encoding="utf-8"))            # 沒污染節流 state
-    # 隨後真推不被 dry-run 壓掉 → 仍 alert
+    assert dr["freshness"]["would_alert"] is True and dr["freshness"]["alerted"] is False
+    assert not list((tmp_path / "alerts").glob("*data_freshness*.json"))
+    saved = json.loads(state.read_text(encoding="utf-8")) if state.exists() else {}
+    assert "freshness_alert" not in saved
     real = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
                        realert_days=3, today=TODAY)
-    assert real["freshness"]["alerted"] is True
+    assert real["freshness"]["alerted"] is True   # 真推不被 dry-run 壓掉
 
 
 def test_broken_throttle_state_does_not_crash(tmp_path, monkeypatch):
-    """#2：壞掉的 watcher_state.json（last_alert_date 非法）不丟例外，視為無節流續推。"""
+    """#2：壞掉的節流紀錄（last_alert_date 非法）不丟例外、視為無節流續推。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
-    _write_master(master, "20260504")
+    _write_master(master, "tender_20260302.xml")
     state.write_text(json.dumps({"freshness_alert": {
-        "latest_date": "20260504", "last_alert_date": "not-a-date"}}),
+        "latest_batch": "20260302", "last_alert_date": "not-a-date"}}),
         encoding="utf-8")
     r = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
                     realert_days=3, today=TODAY)
-    assert r["freshness"]["alerted"] is True   # 壞 state → 當無節流、續推
+    assert r["freshness"]["alerted"] is True
 
 
 def test_failed_send_does_not_start_throttle(tmp_path, monkeypatch):
-    """codex 複審：實際沒推到 Slack（送失敗/no_webhook）→ 不啟動 3 天節流。
-
-    否則沒送達也消耗 realert 窗 → 告警被靜默壓掉、回到「靜默斷糧」。
-    驗：第一輪沒送達 → 不標 alerted、不寫節流 state；下一輪仍會嘗試推。
-    """
+    """codex 複審：沒推到 Slack（sent=False）→ 不啟動節流，下輪仍會重試。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
-    # 模擬「沒送達」：no_webhook / 送失敗都回 sent=False
     monkeypatch.setattr(watcher, "notify_freshness",
                         lambda *a, **k: {"sent": False, "reason": "no_webhook"})
     weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
-    _write_master(master, "20260504")
+    _write_master(master, "tender_20260302.xml")
     r1 = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
                      realert_days=3, today=date(2026, 6, 29))
-    assert r1["freshness"]["alerted"] is False                # 沒送達 → 未標已通知
+    assert r1["freshness"]["alerted"] is False
     saved = json.loads(state.read_text(encoding="utf-8")) if state.exists() else {}
-    assert "freshness_alert" not in saved                     # 節流 state 未被設
-    # alert 檔仍留痕（可追）
-    assert list((tmp_path / "alerts").glob("*data_freshness*.json"))
-    # 下一輪（隔 1 天 < realert）仍會嘗試推（沒被節流壓掉）→ 換成送達成功就 alert
+    assert "freshness_alert" not in saved
+    assert list((tmp_path / "alerts").glob("*data_freshness*.json"))   # 仍留痕
     monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     r2 = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
                      realert_days=3, today=date(2026, 6, 30))
-    assert r2["freshness"]["alerted"] is True                 # 未被節流，重試成功
+    assert r2["freshness"]["alerted"] is True   # 未被節流，重試成功
 
 
 def test_master_read_failure_does_not_break_p0(tmp_path, monkeypatch):
-    """#5：master 不存在 → 新鮮度降級成 warning，P0 流程仍正常跑完。"""
+    """#5：master 不存在 → 新鮮度降級 warning，P0 流程仍跑完。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
     weekly, state = tmp_path / "w.csv", tmp_path / "s.json"
-    _write_weekly(weekly, n=1)                       # 有 1 筆 P0
+    _write_weekly(weekly, batch="tender_20260402.xml", n=1)
     res = watcher.run(str(weekly), str(state), dry_run=True,
-                      master_csv=str(tmp_path / "does_not_exist.csv"), today=TODAY)
-    assert res["status"] == "ok"                     # P0 流程沒被中斷
-    assert res["freshness"].get("error")             # 新鮮度只記 error
-    assert res["fetched"] == 1                        # weekly 1 筆有讀進來、流程跑完
-    assert isinstance(res["p0"], int)                # P0 仍正常算出（未崩）
-
-
-def test_future_date_does_not_mask_staleness(tmp_path):
-    """#4：未來日期髒行（20991231）不得成為最大日期遮蔽真斷糧。"""
-    fr = check_freshness(_rows("20260504", "20991231"), 14, today=TODAY)
-    assert fr["latest_date"] == "20260504"           # 忽略未來日期
-    assert fr["stale"] is True and fr["age_days"] == 56
-
-
-def test_latest_data_date_filters_future_when_today_given():
-    assert latest_data_date(_rows("20260504", "20991231"), today=TODAY) == "20260504"
-    # 不給 today → 維持舊行為（不過濾，向後相容）
-    assert latest_data_date(_rows("20260504", "20991231")) == "20991231"
+                      master_csv=str(tmp_path / "nope.csv"), today=TODAY)
+    assert res["status"] == "ok" and res["freshness"].get("error")
+    assert res["fetched"] == 1 and isinstance(res["p0"], int)
 
 
 def test_taipei_today_used_by_default():
     """#6：taipei_today 用 Asia/Taipei，不是 UTC date.today。"""
-    from freshness import taipei_today
     import datetime as _dt
     try:
         from zoneinfo import ZoneInfo
@@ -298,7 +327,7 @@ def test_taipei_today_used_by_default():
 
 
 def test_notify_freshness_empty_webhook_no_send_even_with_env(monkeypatch):
-    """#7：明確傳 webhook='' → 不 fallback env、不送（測試環境有 env 也不誤送）。"""
+    """#7：明確傳 webhook='' → 不 fallback env、不送。"""
     monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/should-not-be-used")
-    res = notify_freshness("20260504", 56, 14, dry_run=False, webhook="")
+    res = notify_freshness("20260302", "20260402", 2, dry_run=False, webhook="")
     assert res["sent"] is False and res["reason"] == "no_webhook"

@@ -35,6 +35,7 @@ from tenacity import (
 
 # 軟體開發類過濾規則沿用 g0v fetcher（單一事實源，不重複維護）
 from fetch_bids import BLACKLIST, KEYWORDS, pre_filter  # noqa: E402
+from freshness import batch_key  # noqa: E402 — 批次日期段擷取（issue #22 方案 A）
 
 
 # ---------- 暫時性錯誤 → 觸發 retry（永久性錯誤不重試，免燒配額）----------
@@ -82,11 +83,13 @@ COUNTY_CODE = {
 }
 
 # 要從 pcc-tender 撈的欄位
+# filename（issue #22 方案 A）：批次檔名（如 tender_20260402.xml），唯一可靠的
+#   「發布批次」識別——date 是公告/截止日（可未來），不能當批次/新鮮度依據。
 COLS = [
     "date", "announcement_type", "title", "agency", "agency_id", "job_number",
     "companies", "detail_url", "notice_date", "procurement_type", "procurement_attr",
     "award_way", "award_price", "contact_phone", "contact_person",
-    "agency_county_code", "agency_town_code", "not_obtain_supp_name",
+    "agency_county_code", "agency_town_code", "not_obtain_supp_name", "filename",
 ]
 
 
@@ -144,10 +147,13 @@ class MCP:
                     pass
         return out
 
-    def query_rows(self, where, columns, limit, offset=0, retries=4):
+    def query_rows(self, where, columns, limit, offset=0, retries=4,
+                   order_by="date DESC", group_by=None):
         rid = self._next()
         args = {"dataset_id": DATASET, "where": where, "columns": columns,
-                "limit": limit, "offset": offset, "order_by": "date DESC"}
+                "limit": limit, "offset": offset, "order_by": order_by}
+        if group_by:
+            args["group_by"] = group_by
         last_res = None
         for i in range(retries):
             # 工具名 = query_rows（TwinkleAI 2026 改版已去掉 opendata- prefix；
@@ -230,6 +236,7 @@ def map_row(rec):
         "contact_person": rec.get("contact_person") or "",
         "contact_phone": rec.get("contact_phone") or "",
         "losing_supplier": rec.get("not_obtain_supp_name") or "",
+        "filename": rec.get("filename") or "",   # 批次識別（issue #22 方案 A）
     }
 
 
@@ -245,6 +252,66 @@ def _month_windows(since, until):
         wins.append((cur.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
         cur = nxt
     return wins
+
+
+def pick_latest_batch_keys(filenames, n):
+    """從一堆 filename 取最新 n 個不同批次日期段（'YYYYMM0H'，新→舊）。
+
+    純函式（無網路）：跨 tender_/award_ 前綴用 batch_key 統一成日期段去重再排序。
+    """
+    keys = {bk for f in filenames if (bk := batch_key(f))}
+    return sorted(keys, reverse=True)[:n]
+
+
+def latest_batch_keys(mcp, n):
+    """查資料源最新 n 個批次日期段（issue #22 方案 A）。
+
+    group_by filename 取所有檔名（半月批次數量有限、遠低於 5000），再抽日期段。
+    """
+    d = mcp.query_rows("filename IS NOT NULL", ["filename"], MONTH_LIMIT,
+                       order_by="filename DESC", group_by=["filename"])
+    cols, rows = d.get("columns", []), d.get("rows", [])
+    fi = cols.index("filename") if "filename" in cols else 0
+    files = [r[fi] for r in rows if r]
+    return pick_latest_batch_keys(files, n)
+
+
+def fetch_batches(token, n_batches):
+    """抓資料源最新 n_batches 個批次的軟體類案子（issue #22 方案 A）。
+
+    取代「公告日最近 N 天」窗：資料源永遠落後 ~2 月、date 還可能是未來/截止日，
+    用公告日窗結構性抓不到。改以批次檔（filename）為錨抓最新幾批。
+    """
+    mcp = MCP(token)
+    kw = _kw_clause()
+    keys = latest_batch_keys(mcp, n_batches)
+    print(f"=== fetch pcc-tender 最新 {n_batches} 批次：{keys} ===", file=sys.stderr)
+    rows, seen, dropped_bl = [], set(), 0
+    for bk in keys:
+        # 同一批次跨 tender_/award_ 兩個檔名 → 用日期段 ILIKE 一網打盡
+        where = (f"filename ILIKE '%{bk}%' "
+                 f"AND procurement_attr IN ('勞務類','財物類') AND ({kw})")
+        d = mcp.query_rows(where, COLS, MONTH_LIMIT, order_by="filename DESC")
+        cols, batch = d.get("columns", []), d.get("rows", [])
+        if len(batch) >= MONTH_LIMIT:
+            print(f"⚠️ 批次 {bk} 回傳達上限 {MONTH_LIMIT}，可能截斷", file=sys.stderr)
+        added = 0
+        for r in batch:
+            rec = dict(zip(cols, r))
+            if not pre_filter(rec.get("title") or ""):
+                dropped_bl += 1
+                continue
+            key = (rec.get("agency_id") or rec.get("agency"),
+                   rec.get("job_number"), rec.get("filename"))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(map_row(rec))
+            added += 1
+        print(f"[批次 {bk}] raw {len(batch)} +{added} (total {len(rows)}, bl drop {dropped_bl})",
+              file=sys.stderr)
+        time.sleep(0.2)
+    return rows
 
 
 def fetch(since, until, token):
@@ -287,7 +354,7 @@ OUT_FIELDS = [
     "date", "unit_name", "unit_id", "type", "title", "category", "budget",
     "award_amount", "awarded_at", "companies", "job_number", "url",
     "notice_date", "award_way", "county", "county_code", "town_code",
-    "contact_person", "contact_phone", "losing_supplier",
+    "contact_person", "contact_phone", "losing_supplier", "filename",
 ]
 
 
@@ -302,8 +369,12 @@ def write_csv(rows, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--days", type=int, help="抓過去 N 天（與 --since 二選一）")
-    ap.add_argument("--since", help="起日 YYYY-MM-DD")
+    ap.add_argument("--latest-batches", type=int, default=None,
+                    help="抓最新 N 個發布批次（issue #22 方案 A；每日跑用這個，"
+                         "取代 --days 公告日窗）")
+    ap.add_argument("--days", type=int,
+                    help="抓過去 N 天公告日（backfill/相容用；新案偵測請改 --latest-batches）")
+    ap.add_argument("--since", help="起日 YYYY-MM-DD（backfill 用）")
     ap.add_argument("--until", help="迄日 YYYY-MM-DD（預設今天）")
     ap.add_argument("--out", default="data/weekly.csv")
     ap.add_argument("--token", default=os.environ.get("TWINKLE_API_KEY", ""))
@@ -312,13 +383,20 @@ def main():
     if not args.token:
         sys.exit("缺 token：設環境變數 TWINKLE_API_KEY 或傳 --token")
 
+    # 批次模式（每日跑預設路徑）：以發布批次為錨，不受官方 2 月延遲影響
+    if args.latest_batches:
+        rows = fetch_batches(args.token, args.latest_batches)
+        write_csv(rows, args.out)
+        return
+
+    # 公告日窗模式（backfill / 一次性回補；不適合每日新案偵測）
     until = args.until or datetime.now().strftime("%Y-%m-%d")
     if args.since:
         since = args.since
     elif args.days:
         since = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
     else:
-        sys.exit("需指定 --since 或 --days")
+        sys.exit("需指定 --latest-batches、--since 或 --days")
 
     print(f"=== fetch pcc-tender {since} ~ {until} ===", file=sys.stderr)
     rows = fetch(since, until, args.token)

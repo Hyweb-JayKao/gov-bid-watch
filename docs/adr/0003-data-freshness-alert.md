@@ -79,7 +79,9 @@ watcher 的新案偵測與新鮮度判斷都改用批次。
    月 13 等髒值灌頂排序或推進游標。
 4. **混合資料不靜默丟列**（Medium）：batch 模式下同份資料中無/非法 filename 的列
    另走 seen_keys 水位法（不再只有「全部沒批次」才 fallback），免部分無 filename 的
-   列既不進 cand 也不走水位 → 永久不推。
+   列既不進 cand 也不走水位 → 永久不推。**複審補**：`find_new_by_batch` 回傳
+   `commit_rows = cand + no_batch`，送達後 `_persist` 把 no_batch 列也寫入水位，
+   否則本輪推了下輪又重推、`new` 每輪膨脹。
 5. **壞游標降級**（Medium）：讀 state 的 `last_batch` 先驗 `batch_period`，非法
    （舊格式/手改/merge 污染）→ 警告 + 重設基線，免合法新批次全判不出而靜默漏報。
 

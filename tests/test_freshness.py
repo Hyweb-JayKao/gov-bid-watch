@@ -244,6 +244,9 @@ def test_mixed_filename_no_batch_rows_not_silently_dropped(tmp_path, monkeypatch
                     "url": "", "category": "勞務類", "filename": ""})
     res = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)
     assert res["new"] == 2 and res["pushed"] == 2   # 批次列 + 無 filename 列都被推
+    # 複審修正：第二輪同檔 → 無 filename 列也已進水位，不再重推
+    r2 = watcher.run(str(weekly), str(state), dry_run=False, today=TODAY)
+    assert r2["new"] == 0 and r2["pushed"] == 0
 
 
 def test_broken_cursor_resets_baseline(tmp_path, monkeypatch):

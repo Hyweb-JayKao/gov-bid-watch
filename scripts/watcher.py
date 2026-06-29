@@ -144,13 +144,15 @@ def find_new_by_batch(rows: list, state: dict):
     當新案窗。改追「已處理過的最新批次 `last_batch`」：只把 **比 last_batch 新的
     批次** 的案子當新案，再經既有 seen_keys 去重（同批次重抓不重推）。
 
-    回傳 (new_rows, mode, cand)：
+    回傳 (new_rows, mode, commit_rows)：
+    commit_rows ＝送達成功後該列入 seen_keys 水位的列（避免下輪重推）。
     - mode='fallback'：rows 完全沒有合法批次訊號（filename 全缺/全髒，非 pcc/舊資料）
-      → 退回既有 seen_keys 水位法，向後相容（不讓無 filename 的資料整批靜默）。
+      → 退回既有 seen_keys 水位法；commit_rows = rows。
     - mode='baseline'：冷啟動（state 從未記 last_batch）或 last_batch 壞掉（非法值，
-      codex #5）→ 只設基線、不回補整個歷史 backlog，本輪不視為新案。
+      codex #5）→ 只設基線、不回補整個歷史 backlog；commit_rows = []。
     - mode='batch'：正常批次偵測。cand＝比 last_batch 新的「合法批次」列；同份資料中
-      無/非法 filename 的列（codex #4）另走 seen_keys 水位法，不被靜默忽略。
+      無/非法 filename 的列（codex #4）另走 seen_keys 水位法。**commit_rows = cand +
+      no_batch**——no_batch 列也要進水位，否則本輪推了下輪又重推（codex 複審）。
     """
     cur = latest_batch(rows)   # 只看合法批次（#3）
     if not cur:
@@ -173,7 +175,9 @@ def find_new_by_batch(rows: list, state: dict):
     new = find_new(cand, state)
     if no_batch:
         new = new + find_new(no_batch, state)
-    return new, "batch", cand
+    # commit_rows 含 no_batch（codex 複審）：否則無 filename 列本輪推了但沒進水位、
+    # 下輪又被當新案重推、new 每輪膨脹。
+    return new, "batch", cand + no_batch
 
 
 def run(weekly_csv: str, state_path: str, dry_run: bool = True,
@@ -210,8 +214,9 @@ def run(weekly_csv: str, state_path: str, dry_run: bool = True,
     rows = read_rows(weekly_csv)
     cur_batch = latest_batch(rows)
 
-    # 1. 新案偵測：批次錨（+ seen_keys 去重）；無批次訊號退回水位法
-    new_rows, mode, cand = find_new_by_batch(rows, state)
+    # 1. 新案偵測：批次錨（+ seen_keys 去重）；無批次訊號退回水位法。
+    #    commit_rows＝送達後該列入水位的列（batch 模式含無 filename 的 fallback 列）。
+    new_rows, mode, commit_rows = find_new_by_batch(rows, state)
     # 2. P0 布林過濾
     p0_rows = [r for r in new_rows if is_p0(r)]
 
@@ -249,7 +254,7 @@ def run(weekly_csv: str, state_path: str, dry_run: bool = True,
         仍 save_state 以保住 freshness 節流 / run-log（送失敗不該連帶丟掉）。
         """
         if advance:
-            commit_watermark(cand if mode == "batch" else rows, state)
+            commit_watermark(commit_rows, state)
             if cur_batch:
                 prev = state.get("last_batch", "") or ""
                 state["last_batch"] = max(cur_batch, prev)

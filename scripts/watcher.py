@@ -16,12 +16,13 @@ import csv
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from freshness import check_freshness  # noqa: E402
 from p0_rules import is_p0  # noqa: E402
-from slack_notify import notify  # noqa: E402
+from slack_notify import notify, notify_freshness  # noqa: E402
 from watcher_diff import (  # noqa: E402
     append_runlog,
     commit_watermark,
@@ -33,10 +34,25 @@ from watcher_diff import (  # noqa: E402
 PUSH_CAP = 20          # 單輪推播上限，超過 → 降級 alert 不推
 ALERT_DIR = "data/alerts"
 
+# 資料新鮮度門檻（issue #22）：master 最新 date 距今 > 此天數 → 判定上游斷糧、告警。
+#
+# 為何是 14 而非 brief 初估的 3–5：pcc-tender 是「官方半月公開資料」，正常供料下
+# 最新日期本就會隨發布週期落後。實測健康期（2026 Jan–Apr）master 資料：
+#   - 有料日多為每日/每 1–3 天一筆，
+#   - 但農曆年等假期出現過最大 10 天的資料空窗（2/13→2/23），
+#   - 疊加半月一次的發布節奏，下次發布前最新日期可正常落後到 ~16 天。
+# 門檻設 3–5 會在每個假期/發布前空窗誤報 → 違反「正常供料不誤報」鐵則，
+# 狼來了喊久就被無視＝退回靜默失敗。14 天＝大於實測最壞正常空窗(10)+裕度，
+# 仍能在再次斷糧後約兩週內告警；當前已斷糧 56 天 → 立即觸發。可用 --freshness-days 調。
+FRESHNESS_DAYS = 14
+# 斷糧持續期間的重提間隔（天）：避免長期斷糧每天重複轟炸 Slack。
+# 首次偵測立即推；之後同一停滯狀態每 N 天重提一次（最新日期變動也會重提）。
+FRESHNESS_REALERT_DAYS = 3
+
 
 def write_alert(kind: str, detail: dict) -> str:
     os.makedirs(ALERT_DIR, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S_%f")  # 含微秒：避免同秒多 alert 覆蓋
     path = os.path.join(ALERT_DIR, f"{ts}-{kind}.json")
     payload = {"ts": datetime.now().isoformat(timespec="seconds"),
                "kind": kind, **detail}
@@ -51,14 +67,67 @@ def read_rows(csv_path: str) -> list:
         return list(csv.DictReader(f))
 
 
+def check_data_freshness(master_csv: str, state: dict, dry_run: bool,
+                         freshness_days: int, realert_days: int,
+                         today: date = None) -> dict:
+    """偵測 master 資料源是否斷糧；stale 時推 Slack 告警（含重提節流）。
+
+    回傳 freshness dict（check_freshness 結果再加 alerted: bool）。
+    節流：同一停滯狀態（latest_date 不變）每 realert_days 天最多重提一次；
+    latest_date 變動（資料前進或回退）視為新狀態，立即重提。
+    """
+    today = today or date.today()
+    rows = read_rows(master_csv)
+    fr = check_freshness(rows, freshness_days, today=today)
+    fr["alerted"] = False
+    if not fr["stale"]:
+        # 恢復供料 → 清掉節流紀錄，下次再斷糧能立即重提
+        state.pop("freshness_alert", None)
+        return fr
+
+    prev = state.get("freshness_alert") or {}
+    prev_latest = prev.get("latest_date")
+    prev_date = prev.get("last_alert_date")
+    should = True
+    if prev_latest == fr["latest_date"] and prev_date:
+        prev_d = datetime.strptime(prev_date, "%Y-%m-%d").date()
+        should = (today - prev_d).days >= realert_days
+
+    if should:
+        write_alert("data_freshness", {
+            "source": "pcc-tender", "latest_date": fr["latest_date"],
+            "age_days": fr["age_days"], "threshold_days": freshness_days,
+            "hint": "上游資料源停滯/斷糧；watcher 本身正常。見 issue #22。",
+        })
+        notify_freshness(fr["latest_date"], fr["age_days"], freshness_days,
+                         dry_run=dry_run)
+        state["freshness_alert"] = {"latest_date": fr["latest_date"],
+                                    "last_alert_date": today.isoformat()}
+        fr["alerted"] = True
+    return fr
+
+
 def run(weekly_csv: str, state_path: str, dry_run: bool = True,
-        push_cap: int = PUSH_CAP) -> dict:
+        push_cap: int = PUSH_CAP, master_csv: str = None,
+        freshness_days: int = FRESHNESS_DAYS,
+        realert_days: int = FRESHNESS_REALERT_DAYS, today: date = None) -> dict:
     """跑一輪 watcher。回傳結果 dict（含 status: ok|capped）。
 
     時間封頂改由 CI step `timeout-minutes` 硬 kill（見 daily-watcher.yml），
     本檔不做軟檢查（純記憶體操作跑不到 300s，軟檢查是擺設；ADR D4）。
+
+    master_csv 有給時，額外做「資料新鮮度檢查」（issue #22）：master 最新日期
+    距今 > freshness_days → 推 Slack 斷糧告警。master_csv=None 時跳過（不影響
+    既有 P0 推播流程與舊測試）。
     """
     state = load_state(state_path)
+
+    # 0. 資料新鮮度檢查（issue #22）：與 P0 流程獨立，斷糧時即使 0 筆也告警。
+    freshness = None
+    if master_csv:
+        freshness = check_data_freshness(master_csv, state, dry_run,
+                                         freshness_days, realert_days, today=today)
+
     rows = read_rows(weekly_csv)
 
     # 1. diff：水位找新出現
@@ -67,7 +136,8 @@ def run(weekly_csv: str, state_path: str, dry_run: bool = True,
     p0_rows = [r for r in new_rows if is_p0(r)]
 
     result = {"fetched": len(rows), "new": len(new_rows),
-              "p0": len(p0_rows), "pushed": 0, "status": "ok", "alert": None}
+              "p0": len(p0_rows), "pushed": 0, "status": "ok", "alert": None,
+              "freshness": freshness}
 
     # 3. 成本封頂：推播候選過多 → 規則錯/資料異常 → 不推、alert
     #    ⚠️ 0 漏報鐵則（issue #14 §4）：capped 時水位仍前進，被擋的 P0 下輪
@@ -112,10 +182,15 @@ def main():
     ap.add_argument("--push", action="store_true",
                     help="實際推 Slack（預設 dry-run；需 env SLACK_WEBHOOK_URL）")
     ap.add_argument("--push-cap", type=int, default=PUSH_CAP)
+    ap.add_argument("--master", default=None,
+                    help="master 資料集 CSV；給了才做資料新鮮度檢查（issue #22）")
+    ap.add_argument("--freshness-days", type=int, default=FRESHNESS_DAYS,
+                    help=f"資料最新日期距今超過此天數判定斷糧（預設 {FRESHNESS_DAYS}）")
     args = ap.parse_args()
 
     res = run(args.weekly, args.state, dry_run=not args.push,
-              push_cap=args.push_cap)
+              push_cap=args.push_cap, master_csv=args.master,
+              freshness_days=args.freshness_days)
     print(json.dumps(res, ensure_ascii=False), file=sys.stderr)
     # capped 用非零退出碼讓 CI 標記降級（但不算 fetch 失敗）
     if res["status"] == "capped":

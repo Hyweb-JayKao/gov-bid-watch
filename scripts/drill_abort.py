@@ -58,10 +58,12 @@ def run_drill():
     _write_csv(csvp, rows)
 
     try:
-        # 1. 建穩定水位：先跑一輪把全部收進水位（dry-run）
-        watcher.run(csvp, statep, dry_run=True, push_cap=PUSH_CAP)
+        # 1. 建穩定水位：直接把全部列收進水位（dry-run 現為唯讀、不持久化，
+        #    故改直接 commit_watermark 種水位，模擬已穩定運行的 watcher）。
         st = load_state(statep)
-        baseline_run = watcher.run(csvp, statep, dry_run=True, push_cap=PUSH_CAP)
+        commit_watermark(rows, st)
+        save_state(st, statep)
+        baseline_run = watcher.run(csvp, statep, dry_run=False, push_cap=PUSH_CAP)
         assert baseline_run["new"] == 0, "穩定態應 0 新出現"
 
         # 2. 跑偏：回退水位（刪掉全部 seen → 舊案重新變新）
@@ -70,8 +72,9 @@ def run_drill():
         save_state(st, statep)
         print(f"[drill] 水位回退 {removed} 筆（模擬跑偏/資料異常）", file=sys.stderr)
 
-        # 3. 再跑一輪 → 應觸發封頂
-        res = watcher.run(csvp, statep, dry_run=True, push_cap=PUSH_CAP)
+        # 3. 再跑一輪 → 應觸發封頂（dry_run=False；capped 路徑不呼叫 notify，
+        #    無 webhook → 不會推真 Slack，演練安全）
+        res = watcher.run(csvp, statep, dry_run=False, push_cap=PUSH_CAP)
 
         # 4. 斷言
         assert res["status"] == "capped", f"應觸發封頂，實得 {res['status']}"

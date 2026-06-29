@@ -9,7 +9,7 @@
 python3 -m pytest -q
 ```
 
-- 期望：全 passed（xfail 不算失敗）。目前 baseline：92 passed / 5 xfailed。
+- 期望：全 passed（xfail 不算失敗）。目前 baseline：130 passed / 5 xfailed。
 - 此指令同時是：
   - CI 在 `pull_request → main` 跑的內容（loop 達標的客觀信號）
   - `PRECOMMIT_TEST_CMD` 應設成的值（commit 前閘3 本機快檢）

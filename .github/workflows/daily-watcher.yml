@@ -17,12 +17,19 @@ on:
     - cron: "0 0 * * *"   # 每日 08:00 台北（2026-06-13 啟用：webhook 已設 + P0 收緊勞務類）
   workflow_dispatch:
     inputs:
-      days:
-        description: "抓取天數（預設 2；每日跑只需近 2 天確保重疊）"
-        default: "2"
+      batches:
+        description: "抓最新 N 個發布批次（預設 3；issue #22 方案 A 批次錨）"
+        default: "3"
       push:
         description: "實際推 Slack？（true=推，預設 false=dry-run）"
         default: "false"
+
+# #3 併發保護（issue #22）：schedule 與 manual dispatch 同時跑會各推一次 Slack、
+# 且兩輪各自讀寫 watcher_state.json 造成節流失效 / 水位競態。同一 workflow 同時
+# 只允許一輪；後到者排隊（不取消正在跑的，避免半途中斷推播/水位寫入）。
+concurrency:
+  group: daily-watcher
+  cancel-in-progress: false
 
 jobs:
   watch:
@@ -47,8 +54,10 @@ jobs:
           if [ -z "$TWINKLE_API_KEY" ]; then
             echo "::error::缺 secret TWINKLE_API_KEY"; exit 1
           fi
-          DAYS="${{ github.event.inputs.days || '2' }}"
-          python scripts/fetch_pcc.py --days "$DAYS" --out data/weekly.csv
+          # issue #22 方案 A：官方天生 ~2 月延遲 + 半月批次發布 → 用「最新批次」抓，
+          # 不再用 --days 公告日窗（對永遠落後 2 月的源結構性抓不到、天天 0 筆）。
+          BATCHES="${{ github.event.inputs.batches || '3' }}"
+          python scripts/fetch_pcc.py --latest-batches "$BATCHES" --out data/weekly.csv
 
       - name: Merge to master
         run: python scripts/merge.py --weekly data/weekly.csv --master data/bids.csv
@@ -62,7 +71,8 @@ jobs:
         run: |
           # schedule 觸發（每日自動）→ 真推；手動 dispatch → 看 input（預設 dry-run）
           PUSH="${{ github.event.inputs.push || (github.event_name == 'schedule' && 'true' || 'false') }}"
-          ARGS="--weekly data/weekly.csv --state data/watcher_state.json"
+          # --master 開啟資料新鮮度檢查（issue #22）：上游斷糧時即使 0 筆也推 Slack 告警
+          ARGS="--weekly data/weekly.csv --state data/watcher_state.json --master data/bids.csv"
           if [ "$PUSH" = "true" ]; then ARGS="$ARGS --push"; fi
           # watcher capped 回 exit 2 → 標記但不讓整個 job 失敗（降級是正常路徑；
           # 時間封頂改靠本 step timeout-minutes 硬 kill，不再經 exit 2）

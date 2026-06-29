@@ -16,9 +16,9 @@ on:
     - cron: "0 0 * * 1"  # 每週一 08:00 台北（手動 dispatch 驗證成功後啟用）
   workflow_dispatch:
     inputs:
-      days:
-        description: "抓取天數（預設 14；pcc 為半月公開資料，14 天確保重疊）"
-        default: "14"
+      batches:
+        description: "抓最新 N 個發布批次（預設 3；issue #22 方案 A 批次錨）"
+        default: "3"
 
 jobs:
   fetch:
@@ -43,8 +43,9 @@ jobs:
             echo "::error::缺 secret TWINKLE_API_KEY（Settings → Secrets → Actions）"
             exit 1
           fi
-          DAYS="${{ github.event.inputs.days || '14' }}"
-          python scripts/fetch_pcc.py --days "$DAYS" --out data/weekly.csv
+          # issue #22 方案 A：以發布批次為錨抓，不用 --days 公告日窗（官方天生 2 月延遲）
+          BATCHES="${{ github.event.inputs.batches || '3' }}"
+          python scripts/fetch_pcc.py --latest-batches "$BATCHES" --out data/weekly.csv
 
       - name: Merge to master
         run: python scripts/merge.py --weekly data/weekly.csv --master data/bids.csv

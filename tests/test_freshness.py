@@ -95,6 +95,7 @@ def test_notify_freshness_no_webhook_safe_degrade():
 # ---------- watcher 整合 ----------
 def test_run_stale_master_fires_freshness(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly = tmp_path / "w.csv"
     state = tmp_path / "s.json"
     master = tmp_path / "m.csv"
@@ -137,6 +138,7 @@ def test_run_no_master_skips_freshness(tmp_path):
 def test_freshness_realert_throttled(tmp_path, monkeypatch):
     """同一停滯狀態隔天再跑 → 節流不重複轟炸（< realert_days）。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly = tmp_path / "w.csv"
     state = tmp_path / "s.json"
     master = tmp_path / "m.csv"
@@ -155,6 +157,7 @@ def test_freshness_realert_throttled(tmp_path, monkeypatch):
 def test_freshness_realert_after_interval(tmp_path, monkeypatch):
     """超過 realert_days 仍斷糧 → 重提一次。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly = tmp_path / "w.csv"
     state = tmp_path / "s.json"
     master = tmp_path / "m.csv"
@@ -171,6 +174,7 @@ def test_freshness_realert_after_interval(tmp_path, monkeypatch):
 def test_freshness_recovery_clears_throttle(tmp_path, monkeypatch):
     """斷糧→恢復供料→再斷糧：恢復時清節流，再斷糧能立即重提。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly = tmp_path / "w.csv"
     state = tmp_path / "s.json"
     master = tmp_path / "m.csv"
@@ -197,6 +201,7 @@ def test_dry_run_does_not_consume_throttle_or_write(tmp_path, monkeypatch):
     回歸 codex High#1：dry-run 若更新節流，隨後真推會被 realert_days 壓掉。
     """
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
     _write_master(master, "20260504")
@@ -216,6 +221,7 @@ def test_dry_run_does_not_consume_throttle_or_write(tmp_path, monkeypatch):
 def test_broken_throttle_state_does_not_crash(tmp_path, monkeypatch):
     """#2：壞掉的 watcher_state.json（last_alert_date 非法）不丟例外，視為無節流續推。"""
     monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
     weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
     _write_weekly(weekly, n=0)
     _write_master(master, "20260504")
@@ -225,6 +231,33 @@ def test_broken_throttle_state_does_not_crash(tmp_path, monkeypatch):
     r = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
                     realert_days=3, today=TODAY)
     assert r["freshness"]["alerted"] is True   # 壞 state → 當無節流、續推
+
+
+def test_failed_send_does_not_start_throttle(tmp_path, monkeypatch):
+    """codex 複審：實際沒推到 Slack（送失敗/no_webhook）→ 不啟動 3 天節流。
+
+    否則沒送達也消耗 realert 窗 → 告警被靜默壓掉、回到「靜默斷糧」。
+    驗：第一輪沒送達 → 不標 alerted、不寫節流 state；下一輪仍會嘗試推。
+    """
+    monkeypatch.setattr(watcher, "ALERT_DIR", str(tmp_path / "alerts"))
+    # 模擬「沒送達」：no_webhook / 送失敗都回 sent=False
+    monkeypatch.setattr(watcher, "notify_freshness",
+                        lambda *a, **k: {"sent": False, "reason": "no_webhook"})
+    weekly, state, master = tmp_path / "w.csv", tmp_path / "s.json", tmp_path / "m.csv"
+    _write_weekly(weekly, n=0)
+    _write_master(master, "20260504")
+    r1 = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
+                     realert_days=3, today=date(2026, 6, 29))
+    assert r1["freshness"]["alerted"] is False                # 沒送達 → 未標已通知
+    saved = json.loads(state.read_text(encoding="utf-8")) if state.exists() else {}
+    assert "freshness_alert" not in saved                     # 節流 state 未被設
+    # alert 檔仍留痕（可追）
+    assert list((tmp_path / "alerts").glob("*data_freshness*.json"))
+    # 下一輪（隔 1 天 < realert）仍會嘗試推（沒被節流壓掉）→ 換成送達成功就 alert
+    monkeypatch.setattr(watcher, "notify_freshness", lambda *a, **k: {"sent": True})
+    r2 = watcher.run(str(weekly), str(state), dry_run=False, master_csv=str(master),
+                     realert_days=3, today=date(2026, 6, 30))
+    assert r2["freshness"]["alerted"] is True                 # 未被節流，重試成功
 
 
 def test_master_read_failure_does_not_break_p0(tmp_path, monkeypatch):

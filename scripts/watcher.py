@@ -113,13 +113,19 @@ def check_data_freshness(master_csv: str, state: dict, dry_run: bool,
         return fr
 
     if should:
+        # 先寫 alert 檔留痕（不論最終有無推到 Slack，都要有可追的紀錄）。
         write_alert("data_freshness", {
             "source": "pcc-tender", "latest_date": fr["latest_date"],
             "age_days": fr["age_days"], "threshold_days": freshness_days,
             "hint": "上游資料源停滯/斷糧；watcher 本身正常。見 issue #22。",
         })
-        notify_freshness(fr["latest_date"], fr["age_days"], freshness_days,
-                         dry_run=dry_run)
+        res = notify_freshness(fr["latest_date"], fr["age_days"], freshness_days,
+                               dry_run=dry_run)
+        # ⚠️ 節流只在「真的送達 Slack」才啟動（codex 複審）：no_webhook / 送失敗
+        #    若也消耗 3 天 realert 窗，告警會被靜默壓掉 → 回到「靜默斷糧」。
+        #    沒送達 → 不標 alerted、不寫節流 state，下輪會重試推送。
+        if not res.get("sent"):
+            return fr
         state["freshness_alert"] = {"latest_date": fr["latest_date"],
                                     "last_alert_date": today.isoformat()}
         fr["alerted"] = True

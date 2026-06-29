@@ -73,10 +73,16 @@ PR #23 經 codex 獨立審查後，補以下 7 點（皆有回歸測試）：
    只在 `webhook is None` 才讀 env；明確傳 `""`＝不送（測試在有 `SLACK_WEBHOOK_URL`
    的環境也不會誤送真訊息）。
 
+8. **節流只在「真的送達」才啟動**（codex 複審）：原本只要 `should` 就設
+   `state["freshness_alert"]` + `alerted=True`，但 no_webhook / 送失敗其實沒推到
+   Slack，卻照樣消耗 3 天 realert 窗 → 告警被靜默壓掉、回到「靜默斷糧」。改為以
+   `notify_freshness()` 回傳 `sent=True` 為準才寫節流 / 標 alerted；沒送達仍寫
+   alert 檔留痕但不啟動節流，下輪重試推送。
+
 ## 影響
 
 - 不動 `fetch_pcc.py`（換源是 issue #22 工項 2/3，未拍板，本 PR 不碰）。
 - 新增 `scripts/freshness.py`（含 `taipei_today`）、`slack_notify.notify_freshness`、
   watcher `--master`/`--freshness-days`、`daily-watcher.yml` 加 `--master data/bids.csv`
   + `concurrency`。
-- 測試：全套 137 passed / 5 xfailed（`tests/test_freshness.py` 新增 7 點修正回歸）。
+- 測試：全套 138 passed / 5 xfailed（`tests/test_freshness.py` 含 7+1 點修正回歸）。

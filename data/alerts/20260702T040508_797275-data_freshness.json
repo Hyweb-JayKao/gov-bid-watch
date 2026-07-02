@@ -1,0 +1,9 @@
+{
+  "ts": "2026-07-02T04:05:08",
+  "kind": "data_freshness",
+  "source": "pcc-tender",
+  "latest_batch": "20260302",
+  "expected_batch": "20260402",
+  "lag_periods": 2,
+  "hint": "上游批次沒如期更新（非官方固有 2 月延遲）；watcher 本身正常。見 issue #22。"
+}

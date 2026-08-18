@@ -46,6 +46,10 @@ g0v API (pcc-api.openfun.app) Cloudflare 擋 GitHub Actions IP 段回 403，
 2. **TwinkleAI pcc-tender**（新，`scripts/fetch_pcc.py`）— 行政院公共工程委員會
    政府電子採購網 web.pcc.gov.tw 官方半月公開資料 mirror，**2015→今、16 萬+ 筆、21 欄、無 403**。
 
+> 📘 **TwinkleAI MCP 的操作細節與踩坑**（transport 升級、`offset` 帶 WHERE 失效、
+> 資料集 caveat、token 撈取路徑）見 **[docs/TWINKLE-MCP-KN.md](docs/TWINKLE-MCP-KN.md)**。
+> 改 `fetch_pcc.py` 之前先讀，那些坑都踩過了。
+
 ### 切換到 pcc-tender（fetch_pcc.py）
 
 純 HTTP（JSON-RPC over SSE）打 TwinkleAI MCP endpoint，**不依賴 Claude Code**，

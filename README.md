@@ -1,3 +1,5 @@
+# gov-bid-watch — 政府標案觀測
+
 > 政府標案觀測（軟體開發類）— 每週自動抓取 + Streamlit Dashboard。
 
 ## 版面（左側導覽 + 總覽儀表板）
@@ -80,13 +82,7 @@ county_code / town_code / contact_person / contact_phone / losing_supplier`。
 - **正向關鍵字**：系統、軟體、資訊、網站、APP、平台/平臺、維運、數位、雲端、AI...
 - **黑名單**：工程、營造、建築、道路、橋樑、管線...（排除土木/建築類誤抓）
 - **分類白名單**：g0v 用細分碼 `勞務類*`+`財物類4*`；pcc 用粗分類 `勞務類`+`財物類`
-  （`KEYWORDS`/`BLACKLIST` 兩 fetcher 共用，定義在 `fetch_bids.py`）
-
-## 過濾規則
-
-- **正向關鍵字**：系統、軟體、資訊、網站、APP、平台/平臺、維運、數位、雲端、AI...
-- **黑名單**：工程、營造、建築、道路、橋樑、管線...（排除土木/建築類誤抓）
-- **分類白名單**（tender detail 模式）：`勞務類*` + `財物類4*`（資訊設備）
+  （`KEYWORDS`/`BLACKLIST` 兩 fetcher 共用，定義在 `fetch_bids.py`；tender detail 模式白名單＝`勞務類*`+`財物類4*` 資訊設備）
 
 ## 本地開發
 
